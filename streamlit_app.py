@@ -287,20 +287,23 @@ def top_bar_chart(df, name_col, value_col, title, top_n=10):
     st.pyplot(fig)
 
 def format_display_table(df, count_cols=None, rate_cols=None, score_cols=None):
+    """Return a plain DataFrame for maximum Streamlit Cloud stability.
+    Formatting is handled by rounding numeric columns instead of pandas Styler.
+    """
+    df = df.copy()
     count_cols = count_cols or []
     rate_cols = rate_cols or []
     score_cols = score_cols or []
-    format_dict = {}
     for col in count_cols:
         if col in df.columns:
-            format_dict[col] = "{:.0f}"
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(0)
     for col in rate_cols:
         if col in df.columns:
-            format_dict[col] = "{:.3f}"
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(3)
     for col in score_cols:
         if col in df.columns:
-            format_dict[col] = "{:.4f}" if col == "Valuation Score" else "{:.1f}"
-    return df.style.format(format_dict)
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(4 if col == "Valuation Score" else 1)
+    return df
 
 
 
@@ -447,7 +450,7 @@ def train_random_forest_models(ml_training_df, feature_cols, target_stats, rando
             X_train, X_test, y_train, y_test = train_test_split(X_valid, y_valid, test_size=0.25, random_state=random_state)
         else:
             X_train, X_test, y_train, y_test = X_valid, X_valid, y_valid, y_valid
-        model = RandomForestRegressor(n_estimators=350, max_depth=9, min_samples_leaf=4, random_state=random_state, n_jobs=-1)
+        model = RandomForestRegressor(n_estimators=100, max_depth=8, min_samples_leaf=5, random_state=random_state, n_jobs=1)
         model.fit(X_train, y_train)
         preds = model.predict(X_test)
         importances = pd.DataFrame({"Feature": feature_cols, "Importance": model.feature_importances_}).sort_values("Importance", ascending=False)
@@ -1154,7 +1157,7 @@ with tab_ml:
             if not metrics_df.empty:
                 st.subheader("Model Accuracy Check")
                 st.caption("MAE means average miss. For example, HR MAE of 4 means the model is typically off by about 4 home runs on the test seasons.")
-                st.dataframe(clean_ui_columns(metrics_df).style.format({"MAE": "{:.3f}", "R²": "{:.3f}"}), use_container_width=True, hide_index=True)
+                st.dataframe(clean_ui_columns(metrics_df.round({"MAE": 3, "R²": 3})), use_container_width=True, hide_index=True)
 
             if current_rows.empty:
                 st.warning("No current players met the minimum playing-time filter for prediction.")
@@ -1201,15 +1204,14 @@ with tab_ml:
                 }))
 
                 st.subheader("Next-Season Advanced ML Projections")
-                st.dataframe(
-                    ml_display.style.format({
-                        **{c: "{:.0f}" for c in ml_display.columns if (c.startswith("Predicted ") or c.startswith("Final ")) and c.replace("Predicted ", "").replace("Final ", "") not in RATE_STATS},
-                        **{c: "{:.3f}" for c in ml_display.columns if (c.startswith("Predicted ") or c.startswith("Final ")) and c.replace("Predicted ", "").replace("Final ", "") in RATE_STATS},
-                        "Age": "{:.0f}", "Recent Games": "{:.0f}", "Recent AB": "{:.0f}"
-                    }),
-                    use_container_width=True,
-                    hide_index=True
-                )
+                for _col in ml_display.columns:
+                    if _col.startswith(("Predicted ", "Final ")):
+                        _stat = _col.replace("Predicted ", "").replace("Final ", "")
+                        ml_display[_col] = pd.to_numeric(ml_display[_col], errors="coerce").round(3 if _stat in RATE_STATS else 0)
+                for _col in ["Age", "Recent Games", "Recent AB"]:
+                    if _col in ml_display.columns:
+                        ml_display[_col] = pd.to_numeric(ml_display[_col], errors="coerce").round(0)
+                st.dataframe(ml_display, use_container_width=True, hide_index=True)
 
                 if not ml_display.empty:
                     st.subheader("Top Prediction Summary")
