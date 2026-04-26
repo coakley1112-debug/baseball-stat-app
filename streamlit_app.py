@@ -4,6 +4,23 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+
+def read_required_csv(filename):
+    path = BASE_DIR / filename
+    if not path.exists():
+        st.error(
+            f"Missing required data file: {filename}. Upload {filename} to the same GitHub repository folder as this app file. "
+            "Streamlit Cloud is case-sensitive, so the filename must match exactly."
+        )
+        st.stop()
+    try:
+        return pd.read_csv(path, low_memory=False)
+    except Exception as e:
+        st.error(f"Could not read {filename}: {e}")
+        st.stop()
 
 try:
     from sklearn.ensemble import RandomForestRegressor
@@ -623,9 +640,9 @@ def make_ml_prediction_summary(row, sort_stat):
 
 @st.cache_data
 def load_data():
-    people = pd.read_csv("People.csv", low_memory=False)
-    batting = pd.read_csv("Batting.csv", low_memory=False)
-    fielding = pd.read_csv("Fielding.csv", low_memory=False)
+    people = read_required_csv("People.csv")
+    batting = read_required_csv("Batting.csv")
+    fielding = read_required_csv("Fielding.csv")
 
     batting["teamID_original"] = batting["teamID"]
     fielding["teamID_original"] = fielding["teamID"]
@@ -740,7 +757,7 @@ with tab_hist:
         "R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "BA", "OBP", "SLG", "OPS"
     ]].copy().sort_values(by=hist_sort_stat, ascending=(hist_sort_order == "Ascending"), na_position="last")
 
-    top_bar_chart(hist_display_raw, "fullName", hist_sort_stat, f"Top 10 Seasons by {hist_sort_label}")
+    top_bar_chart(hist_display_raw, "fullName", hist_sort_stat, f"Top 10 Seasons by {hist_sort_stat}")
 
     c7, c8, c9 = st.columns(3)
     c7.metric("Rows Returned", len(hist_display_raw))
