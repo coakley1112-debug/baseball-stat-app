@@ -354,6 +354,27 @@ def clean_ui_columns(df):
     drop_cols = [c for c in df.columns if str(c).lower().endswith("id") or "playerid" in str(c).lower() or "teamid" in str(c).lower()]
     return df.drop(columns=drop_cols, errors="ignore")
 
+
+
+def baseball_age_for_season(season_year, birth_year, birth_month=np.nan, birth_day=np.nan):
+    """Approximate MLB season age using July 1 of the season, not simply season_year - birth_year.
+    This prevents late-year birthdays from being overstated by one year.
+    """
+    try:
+        season_year = int(season_year)
+        birth_year = int(float(birth_year))
+    except Exception:
+        return np.nan
+    try:
+        birth_month = int(float(birth_month))
+        birth_day = int(float(birth_day))
+    except Exception:
+        birth_month, birth_day = 7, 1
+    age = season_year - birth_year
+    if (birth_month, birth_day) > (7, 1):
+        age -= 1
+    return age
+
 def add_latest_and_projection_columns(base_df, recent_data):
     df = base_df.copy()
     latest_stats = (
@@ -386,7 +407,7 @@ def build_ml_training_set(yearly_source, lookback_years=3, min_games_per_window=
     """Create supervised learning rows: last N years of stats -> following year stats."""
     target_stats = target_stats or ML_TARGET_STATS
     df = yearly_source.copy().sort_values(["playerID", "yearID"])
-    for col in ["yearID", "birthYear"] + ML_BASE_FEATURE_STATS:
+    for col in ["yearID", "birthYear", "birthMonth", "birthDay"] + ML_BASE_FEATURE_STATS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     rows = []
@@ -407,7 +428,7 @@ def build_ml_training_set(yearly_source, lookback_years=3, min_games_per_window=
                 "bats": target.get("bats", ""),
                 "predict_year": int(target["yearID"]),
                 "last_year": int(target["yearID"]) - 1,
-                "age_entering_year": int(target["yearID"]) - birth_year if pd.notna(birth_year) else np.nan,
+                "age_entering_year": baseball_age_for_season(target["yearID"], birth_year, target.get("birthMonth", np.nan), target.get("birthDay", np.nan)),
                 "hist_G_total": pd.to_numeric(history["G"], errors="coerce").sum(),
                 "hist_AB_total": pd.to_numeric(history["AB"], errors="coerce").sum(),
             }
@@ -593,7 +614,7 @@ def apply_advanced_projection_adjustments(pred_df, current_rows, ml_training_df,
 def build_current_prediction_rows(yearly_source, lookback_years=3, min_games_per_window=50):
     """Create one current row per active/recent player using the latest N available years."""
     df = yearly_source.copy().sort_values(["playerID", "yearID"])
-    for col in ["yearID", "birthYear"] + ML_BASE_FEATURE_STATS:
+    for col in ["yearID", "birthYear", "birthMonth", "birthDay"] + ML_BASE_FEATURE_STATS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     max_year = int(df["yearID"].max())
@@ -615,9 +636,13 @@ def build_current_prediction_rows(yearly_source, lookback_years=3, min_games_per
             "bats": latest.get("bats", ""),
             "last_year": int(latest["yearID"]),
             "prediction_year": int(latest["yearID"]) + 1,
-            "age_entering_year": int(latest["yearID"] + 1) - birth_year if pd.notna(birth_year) else np.nan,
+            "age_entering_year": baseball_age_for_season(int(latest["yearID"]) + 1, birth_year, latest.get("birthMonth", np.nan), latest.get("birthDay", np.nan)),
             "hist_G_total": pd.to_numeric(history["G"], errors="coerce").sum(),
             "hist_AB_total": pd.to_numeric(history["AB"], errors="coerce").sum(),
+            "Last HR": pd.to_numeric(latest.get("HR", np.nan), errors="coerce"),
+            "Last RBI": pd.to_numeric(latest.get("RBI", np.nan), errors="coerce"),
+            "Last SB": pd.to_numeric(latest.get("SB", np.nan), errors="coerce"),
+            "Last OPS": pd.to_numeric(latest.get("OPS", np.nan), errors="coerce"),
         }
         for stat in ML_BASE_FEATURE_STATS:
             values = pd.to_numeric(history[stat], errors="coerce")
@@ -641,6 +666,74 @@ def make_ml_prediction_summary(row, sort_stat):
         f"Unlike the simple trend tab, this projection blends Random Forest, age curves, similar-player history, and regression-to-the-mean."
     )
 
+
+
+def aggregate_player_year_team(df):
+    """One row per player-year-actual team. Used when Historical Explorer shows split seasons."""
+    if df.empty:
+        return df.copy()
+    group_cols = [
+        "playerID", "fullName", "bats", "throws", "birthYear", "birthMonth", "birthDay", "birthCountry",
+        "yearID", "teamID", "teamName", "teamHistoricalName", "primaryPos"
+    ]
+    group_cols = [c for c in group_cols if c in df.columns]
+    stat_cols = [c for c in ["G", "AB", "R", "H", "2B", "3B", "HR", "RBI", "SB", "CS", "BB", "SO", "IBB", "HBP", "SH", "SF", "GIDP"] if c in df.columns]
+    out = df.groupby(group_cols, as_index=False)[stat_cols].sum()
+    out = add_rate_stats(out)
+    return out
+
+
+def aggregate_player_year_primary_team(df):
+    """One row per player-year, with stats combined and Team set to the primary team in the filtered data."""
+    if df.empty:
+        return df.copy()
+    team_basis = aggregate_player_year_team(df)
+    basis_col = "G" if "G" in team_basis.columns else "AB"
+    primary_team = (
+        team_basis.sort_values(["playerID", "yearID", basis_col, "AB"], ascending=[True, True, False, False])
+        .drop_duplicates(["playerID", "yearID"])
+        [["playerID", "yearID", "teamID", "teamName", "teamHistoricalName"]]
+        .rename(columns={"teamID": "primaryTeamID", "teamName": "primaryTeamName", "teamHistoricalName": "primaryHistoricalTeamName"})
+    )
+    group_cols = [
+        "playerID", "fullName", "bats", "throws", "birthYear", "birthMonth", "birthDay", "birthCountry", "yearID"
+    ]
+    group_cols = [c for c in group_cols if c in df.columns]
+    stat_cols = [c for c in ["G", "AB", "R", "H", "2B", "3B", "HR", "RBI", "SB", "CS", "BB", "SO", "IBB", "HBP", "SH", "SF", "GIDP"] if c in df.columns]
+    out = df.groupby(group_cols, as_index=False)[stat_cols].sum()
+    out = add_rate_stats(out)
+    out = out.merge(primary_team, on=["playerID", "yearID"], how="left")
+    pos_basis = (
+        df.groupby(["playerID", "yearID", "primaryPos"], as_index=False)["G"].sum()
+        .sort_values(["playerID", "yearID", "G", "primaryPos"], ascending=[True, True, False, True])
+        .drop_duplicates(["playerID", "yearID"])[["playerID", "yearID", "primaryPos"]]
+    )
+    out = out.merge(pos_basis, on=["playerID", "yearID"], how="left")
+    return out
+
+
+def add_primary_team_for_career(grouped_df, source_df):
+    """Attach primary team/position to player-level career totals based on most games/AB in the filtered source."""
+    if grouped_df.empty or source_df.empty:
+        return grouped_df
+    team_basis = aggregate_player_year_team(source_df)
+    team_games = (
+        team_basis.groupby(["playerID", "teamName", "teamHistoricalName"], as_index=False)[["G", "AB"]]
+        .sum()
+        .sort_values(["playerID", "G", "AB", "teamName"], ascending=[True, False, False, True])
+        .drop_duplicates("playerID")
+        [["playerID", "teamName", "teamHistoricalName"]]
+        .rename(columns={"teamName": "primaryTeamName", "teamHistoricalName": "primaryHistoricalTeamName"})
+    )
+    pos_basis = (
+        source_df.groupby(["playerID", "primaryPos"], as_index=False)[["G", "AB"]]
+        .sum()
+        .sort_values(["playerID", "G", "AB", "primaryPos"], ascending=[True, False, False, True])
+        .drop_duplicates("playerID")
+        [["playerID", "primaryPos"]]
+    )
+    return grouped_df.merge(team_games, on="playerID", how="left").merge(pos_basis, on="playerID", how="left")
+
 @st.cache_data
 def load_data():
     people = read_required_csv("People.csv")
@@ -655,7 +748,7 @@ def load_data():
     batting["teamID"] = batting["teamID"].replace(team_id_mapping)
     fielding["teamID"] = fielding["teamID"].replace(team_id_mapping)
 
-    keep_people = ["playerID", "nameFirst", "nameLast", "birthYear", "birthCountry", "bats", "throws"]
+    keep_people = ["playerID", "nameFirst", "nameLast", "birthYear", "birthMonth", "birthDay", "birthCountry", "bats", "throws"]
     keep_people = [c for c in keep_people if c in people.columns]
     people = people[keep_people].copy()
     people["nameFirst"] = people["nameFirst"].fillna("").astype(str).str.strip()
@@ -669,15 +762,28 @@ def load_data():
 
     if "yearID" in fielding.columns:
         fielding["yearID"] = pd.to_numeric(fielding["yearID"], errors="coerce").fillna(0)
+    if "G" in fielding.columns:
+        fielding["G"] = pd.to_numeric(fielding["G"], errors="coerce").fillna(0)
+    else:
+        fielding["G"] = 0
 
-    fielding_counts = fielding.groupby(["playerID", "yearID", "POS"]).size().reset_index(name="games_at_pos")
-    primary_positions = (
-        fielding_counts.sort_values(["playerID", "yearID", "games_at_pos"], ascending=[True, True, False])
-        .drop_duplicates(subset=["playerID", "yearID"])
-        [["playerID", "yearID", "POS"]]
-        .rename(columns={"POS": "primaryPos"})
+    # Group LF/CF/RF together so outfielders are classified as OF instead of splitting their games.
+    fielding["POS_grouped"] = fielding["POS"].replace({"LF": "OF", "CF": "OF", "RF": "OF"})
+    valid_primary_positions = ["C", "1B", "2B", "3B", "SS", "OF", "P", "DH"]
+    fielding_for_pos = fielding[fielding["POS_grouped"].isin(valid_primary_positions)].copy()
+
+    fielding_counts = (
+        fielding_for_pos
+        .groupby(["playerID", "yearID", "POS_grouped"], as_index=False)["G"]
+        .sum()
+        .rename(columns={"G": "games_at_pos"})
     )
-    primary_positions = primary_positions[~primary_positions["primaryPos"].isin(["PH", "PR"])]
+    primary_positions = (
+        fielding_counts.sort_values(["playerID", "yearID", "games_at_pos", "POS_grouped"], ascending=[True, True, False, True])
+        .drop_duplicates(subset=["playerID", "yearID"])
+        [["playerID", "yearID", "POS_grouped"]]
+        .rename(columns={"POS_grouped": "primaryPos"})
+    )
 
     batting = batting.merge(people, on="playerID", how="left")
     batting = batting.merge(primary_positions, on=["playerID", "yearID"], how="left")
@@ -686,7 +792,7 @@ def load_data():
     batting = add_rate_stats(batting)
 
     yearly = (
-        batting.groupby(["playerID", "fullName", "bats", "throws", "birthYear", "birthCountry", "yearID"], as_index=False)
+        batting.groupby(["playerID", "fullName", "bats", "throws", "birthYear", "birthMonth", "birthDay", "birthCountry", "yearID"], as_index=False)
         [["G", "AB", "R", "H", "2B", "3B", "HR", "RBI", "SB", "CS", "BB", "SO", "IBB", "HBP", "SH", "SF", "GIDP"]]
         .sum()
     )
@@ -722,55 +828,88 @@ tab_hist, tab_career, tab_leaders, tab_compare, tab_trend, tab_value, tab_ml = s
 ])
 
 with tab_hist:
-    render_section_header("🔎 Historical Explorer", "Find individual player seasons using filters, minimum stat thresholds, sorting, and charts.")
+    render_section_header(
+        "🔎 Historical Explorer",
+        "Find individual player seasons. Split-team seasons can stay as separate team rows or be combined into one primary-team season row."
+    )
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         hist_year_range = st.slider("Year Range", year_min, year_max, (default_start_hist, year_max), key="hist_year")
     with c2:
-        bats_options = sorted([x for x in yearly_df["bats"].dropna().unique() if str(x).strip() != ""])
+        bats_options = sorted([x for x in batting_df["bats"].dropna().unique() if str(x).strip() != ""])
         hist_bats = st.multiselect("Batting Hand", bats_options, default=bats_options, key="hist_bats")
     with c3:
-        pos_options = sorted([x for x in yearly_df["primaryPos"].dropna().unique() if str(x).strip() != "" and x not in ["PH", "PR"]])
+        pos_options = sorted([x for x in batting_df["primaryPos"].dropna().unique() if str(x).strip() != "" and x not in ["PH", "PR"]])
         hist_pos = st.multiselect("Primary Position", pos_options, default=pos_options, key="hist_pos")
     with c4:
-        actual_team_names = sorted(set(yearly_df["primaryTeamName"].dropna().astype(str)).intersection(set(team_id_to_name.values())))
+        actual_team_names = sorted(set(batting_df["teamName"].dropna().astype(str)).intersection(set(team_id_to_name.values())))
         hist_teams = st.multiselect("Franchise", actual_team_names, default=actual_team_names, key="hist_team")
 
-    hist = yearly_df[(yearly_df["yearID"] >= hist_year_range[0]) & (yearly_df["yearID"] <= hist_year_range[1])].copy()
-    if hist_bats: hist = hist[hist["bats"].isin(hist_bats)]
-    if hist_pos: hist = hist[hist["primaryPos"].isin(hist_pos)]
-    if hist_teams: hist = hist[hist["primaryTeamName"].isin(hist_teams)]
+    combine_split_seasons = st.toggle(
+        "Combine split-team seasons into one primary-team row",
+        value=False,
+        key="hist_combine_split_seasons",
+        help="OFF = one row per player/year/team. ON = one row per player/year, with Team assigned to the team where he had the most games/AB in the filtered data."
+    )
+
+    hist_source = batting_df[(batting_df["yearID"] >= hist_year_range[0]) & (batting_df["yearID"] <= hist_year_range[1])].copy()
+    if hist_bats:
+        hist_source = hist_source[hist_source["bats"].isin(hist_bats)]
+    if hist_pos:
+        hist_source = hist_source[hist_source["primaryPos"].isin(hist_pos)]
+    if hist_teams:
+        hist_source = hist_source[hist_source["teamName"].isin(hist_teams)]
+
+    if combine_split_seasons:
+        hist = aggregate_player_year_primary_team(hist_source)
+        team_col_for_display = "primaryHistoricalTeamName"
+        team_sort_col = "primaryTeamName"
+        hist_note = "Combined mode: one row per player-season. Team is the primary team in the filtered data."
+    else:
+        hist = aggregate_player_year_team(hist_source)
+        team_col_for_display = "teamHistoricalName"
+        team_sort_col = "teamName"
+        hist_note = "Split mode: one row per player-season-team. Split seasons stay separate."
 
     hist = apply_stat_min_filters(hist, "hist")
     hist = safe_round_rate_stats(hist)
+    st.caption(hist_note)
 
     c5, c6 = st.columns(2)
+    sort_options_hist = [
+        "yearID", "fullName", team_sort_col, team_col_for_display, "primaryPos",
+        "R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "BA", "OBP", "SLG", "OPS"
+    ]
     with c5:
         hist_sort_stat = st.selectbox(
             "Sort Historical Explorer By",
-            ["yearID", "fullName", "primaryTeamName", "primaryHistoricalTeamName", "primaryPos",
-             "R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "BA", "OBP", "SLG", "OPS"],
-            index=10, key="hist_sort_stat"
+            sort_options_hist,
+            index=sort_options_hist.index("HR"),
+            key="hist_sort_stat"
         )
     with c6:
         hist_sort_order = st.selectbox("Sort Order", ["Descending", "Ascending"], index=0, key="hist_sort_order")
 
-    hist_display_raw = hist[[
-        "yearID", "fullName", "bats", "primaryPos", "primaryHistoricalTeamName",
+    display_cols_hist = [
+        "yearID", "fullName", "bats", "primaryPos", team_col_for_display,
         "R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "BA", "OBP", "SLG", "OPS"
-    ]].copy().sort_values(by=hist_sort_stat, ascending=(hist_sort_order == "Ascending"), na_position="last")
+    ]
+    display_cols_hist = [c for c in display_cols_hist if c in hist.columns]
+    hist_display_raw = hist[display_cols_hist].copy()
+    if hist_sort_stat in hist_display_raw.columns:
+        hist_display_raw = hist_display_raw.sort_values(by=hist_sort_stat, ascending=(hist_sort_order == "Ascending"), na_position="last")
 
     top_bar_chart(hist_display_raw, "fullName", hist_sort_stat, f"Top 10 Seasons by {hist_sort_stat}")
 
     c7, c8, c9 = st.columns(3)
     c7.metric("Rows Returned", len(hist_display_raw))
-    top_value = pd.to_numeric(hist_display_raw[hist_sort_stat], errors="coerce").max() if len(hist_display_raw) else 0
+    top_value = pd.to_numeric(hist_display_raw[hist_sort_stat], errors="coerce").max() if len(hist_display_raw) and hist_sort_stat in hist_display_raw.columns else 0
     c8.metric("Top Stat Value", fmt_rate_3(top_value) if hist_sort_stat in RATE_STATS else (fmt_int(top_value) if hist_sort_stat in COUNT_STATS or hist_sort_stat == "yearID" else str(top_value)))
     c9.metric("Year Range", f"{hist_year_range[0]}-{hist_year_range[1]}")
 
     hist_display = hist_display_raw.rename(columns={
         "yearID": "Year", "fullName": "Player", "bats": "Bats", "primaryPos": "Primary Position",
-        "primaryHistoricalTeamName": "Team"
+        team_col_for_display: "Team"
     })
     st.divider()
     st.dataframe(
@@ -779,58 +918,86 @@ with tab_hist:
     )
 
 with tab_career:
-    render_section_header("📚 Career Totals", "Aggregate production across selected years with one clean row per player, using franchise filters but showing the actual historical team in the table.")
+    render_section_header(
+        "📚 Career Totals",
+        "Aggregate career production with an independent display toggle: one primary-team career row or separate totals by each team."
+    )
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         range_career = st.slider("Select Year Range", year_min, year_max, (max(year_min, 2010), year_max), key="career_year")
     with c2:
-        bats_options_career = sorted([x for x in yearly_df["bats"].dropna().unique() if str(x).strip() != ""])
+        bats_options_career = sorted([x for x in batting_df["bats"].dropna().unique() if str(x).strip() != ""])
         bats_filter_career = st.multiselect("Batting Hand", bats_options_career, default=bats_options_career, key="career_bats")
     with c3:
-        pos_options_career = sorted([x for x in yearly_df["primaryPos"].dropna().unique() if str(x).strip() != "" and x not in ["PH", "PR"]])
+        pos_options_career = sorted([x for x in batting_df["primaryPos"].dropna().unique() if str(x).strip() != "" and x not in ["PH", "PR"]])
         pos_filter_career = st.multiselect("Primary Position", pos_options_career, default=pos_options_career, key="career_pos")
     with c4:
-        team_options_career = sorted(set(yearly_df["primaryTeamName"].dropna().astype(str)).intersection(set(team_id_to_name.values())))
+        team_options_career = sorted(set(batting_df["teamName"].dropna().astype(str)).intersection(set(team_id_to_name.values())))
         team_filter_career = st.multiselect("Franchise", team_options_career, default=team_options_career, key="career_team")
 
-    filtered_career = yearly_df[(yearly_df["yearID"] >= range_career[0]) & (yearly_df["yearID"] <= range_career[1])].copy()
-    if bats_filter_career: filtered_career = filtered_career[filtered_career["bats"].isin(bats_filter_career)]
-    if pos_filter_career: filtered_career = filtered_career[filtered_career["primaryPos"].isin(pos_filter_career)]
-    if team_filter_career: filtered_career = filtered_career[filtered_career["primaryTeamName"].isin(team_filter_career)]
-
-    stat_cols_career = ["R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "HBP", "SF"]
-    career_totals = filtered_career.groupby(["playerID", "fullName", "bats"], as_index=False)[stat_cols_career].sum()
-
-    pos_mode = (
-        filtered_career.groupby(["playerID", "primaryPos"]).size().reset_index(name="count")
-        .sort_values(["playerID", "count", "primaryPos"], ascending=[True, False, True])
-        .drop_duplicates(subset=["playerID"])[["playerID", "primaryPos"]]
+    show_career_by_team = st.toggle(
+        "Show career totals separately by team",
+        value=False,
+        key="career_by_team_toggle",
+        help="OFF = one row per player with a Primary Team. ON = one row per player/team, and stat minimums are applied to each team row separately."
     )
-    team_mode = (
-        filtered_career.groupby(["playerID", "primaryTeamName", "primaryHistoricalTeamName"]).size().reset_index(name="count")
-        .sort_values(["playerID", "count", "primaryTeamName", "primaryHistoricalTeamName"], ascending=[True, False, True, True])
-        .drop_duplicates(subset=["playerID"])[["playerID", "primaryTeamName", "primaryHistoricalTeamName"]]
-    )
-    career_totals = career_totals.merge(pos_mode, on="playerID", how="left").merge(team_mode, on="playerID", how="left")
+
+    filtered_career = batting_df[(batting_df["yearID"] >= range_career[0]) & (batting_df["yearID"] <= range_career[1])].copy()
+    if bats_filter_career:
+        filtered_career = filtered_career[filtered_career["bats"].isin(bats_filter_career)]
+    if pos_filter_career:
+        filtered_career = filtered_career[filtered_career["primaryPos"].isin(pos_filter_career)]
+    if team_filter_career:
+        filtered_career = filtered_career[filtered_career["teamName"].isin(team_filter_career)]
+
+    stat_cols_career = ["R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "HBP", "SF", "G"]
+    stat_cols_career = [c for c in stat_cols_career if c in filtered_career.columns]
+
+    if show_career_by_team:
+        # Filter first, aggregate by player + actual team second, then apply stat minimum filters to each team row.
+        grouped_source = aggregate_player_year_team(filtered_career)
+        group_cols = ["playerID", "fullName", "bats", "teamName", "teamHistoricalName"]
+        career_totals = grouped_source.groupby(group_cols, as_index=False)[stat_cols_career].sum()
+        pos_mode = (
+            grouped_source.groupby(["playerID", "teamName", "primaryPos"], as_index=False)[["G", "AB"]]
+            .sum()
+            .sort_values(["playerID", "teamName", "G", "AB", "primaryPos"], ascending=[True, True, False, False, True])
+            .drop_duplicates(["playerID", "teamName"])[["playerID", "teamName", "primaryPos"]]
+        )
+        career_totals = career_totals.merge(pos_mode, on=["playerID", "teamName"], how="left")
+        career_totals["displayTeam"] = career_totals["teamHistoricalName"]
+        career_mode_note = "By-team mode: each player/team row must pass the stat minimum filters on its own."
+    else:
+        # Filter first, aggregate by player second, then apply stat minimum filters to the total row.
+        career_totals = filtered_career.groupby(["playerID", "fullName", "bats"], as_index=False)[stat_cols_career].sum()
+        career_totals = add_primary_team_for_career(career_totals, filtered_career)
+        career_totals["displayTeam"] = career_totals["primaryHistoricalTeamName"]
+        career_mode_note = "Total-career mode: one row per player. Team is the primary team within the filtered data."
+
     career_totals = add_rate_stats(career_totals)
     career_totals = apply_stat_min_filters(career_totals, "career")
     career_totals = safe_round_rate_stats(career_totals)
+    st.caption(career_mode_note)
 
     sort_stat_career = st.selectbox("Sort By", ["HR", "RBI", "SB", "R", "H", "2B", "3B", "BB", "BA", "OBP", "SLG", "OPS", "AB"], index=0, key="career_sort")
     top_bar_chart(career_totals, "fullName", sort_stat_career, f"Top 10 Career Totals by {sort_stat_career}")
 
     c5, c6, c7 = st.columns(3)
-    c5.metric("Players", len(career_totals))
-    c6.metric("Top Player", career_totals.sort_values(sort_stat_career, ascending=False).iloc[0]["fullName"] if len(career_totals) else "N/A")
-    top_career_value = pd.to_numeric(career_totals[sort_stat_career], errors="coerce").max() if len(career_totals) else 0
+    c5.metric("Rows", len(career_totals))
+    c6.metric("Top Player", career_totals.sort_values(sort_stat_career, ascending=False).iloc[0]["fullName"] if len(career_totals) and sort_stat_career in career_totals.columns else "N/A")
+    top_career_value = pd.to_numeric(career_totals[sort_stat_career], errors="coerce").max() if len(career_totals) and sort_stat_career in career_totals.columns else 0
     c7.metric("Top Value", fmt_rate_3(top_career_value) if sort_stat_career in RATE_STATS else fmt_int(top_career_value))
 
-    career_display = career_totals[[
-        "fullName", "bats", "primaryPos", "primaryHistoricalTeamName",
+    career_display_cols = [
+        "fullName", "bats", "primaryPos", "displayTeam",
         "R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "BA", "OBP", "SLG", "OPS"
-    ]].sort_values(sort_stat_career, ascending=False).rename(columns={
-        "fullName": "Player", "bats": "Bats", "primaryPos": "Primary Position",
-        "primaryHistoricalTeamName": "Team"
+    ]
+    career_display_cols = [c for c in career_display_cols if c in career_totals.columns]
+    career_display = career_totals[career_display_cols].copy()
+    if sort_stat_career in career_display.columns:
+        career_display = career_display.sort_values(sort_stat_career, ascending=False)
+    career_display = career_display.rename(columns={
+        "fullName": "Player", "bats": "Bats", "primaryPos": "Primary Position", "displayTeam": "Team"
     })
     st.divider()
     st.dataframe(
@@ -1208,7 +1375,7 @@ with tab_ml:
                         pred_df = pred_df.sort_values(sort_col, ascending=False)
 
                     display_cols = [
-                        "fullName", "bats", "prediction_year", "age_entering_year", "hist_G_total", "hist_AB_total", "Similar Players",
+                        "fullName", "bats", "last_year", "prediction_year", "age_entering_year", "hist_G_total", "hist_AB_total", "Last HR", "Last RBI", "Last SB", "Last OPS", "Similar Players",
                         "Final R", "Final H", "Final 2B", "Final 3B", "Final HR", "Final RBI", "Final SB", "Final BB",
                         "Final BA", "Final OBP", "Final SLG", "Final OPS",
                         "Predicted R", "Predicted H", "Predicted HR", "Predicted RBI", "Predicted SB", "Predicted OPS"
@@ -1220,6 +1387,7 @@ with tab_ml:
                     }))
 
                     st.subheader("Next-Season Advanced ML Projections")
+                    st.caption("Audit check: Last Year and Last HR/RBI/SB/OPS come directly from the latest season available in your CSV files. Age is calculated by baseball season age as of July 1, not simply Prediction Year minus birth year.")
                     for _col in ml_display.columns:
                         if _col.startswith(("Predicted ", "Final ")):
                             _stat = _col.replace("Predicted ", "").replace("Final ", "")
