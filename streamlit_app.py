@@ -1138,111 +1138,127 @@ with tab_ml:
             "The system combines Random Forest predictions with baseball-specific projection logic: similar-player comps, age-curve adjustment, and regression-to-the-mean for more stable forecasts."
         )
 
-        ml_training_df, ml_feature_cols = build_ml_training_set(yearly_df, ml_lookback, ml_min_games, ML_TARGET_STATS)
-        if ml_training_df.empty or not ml_feature_cols:
-            st.warning("Not enough historical data to train the model with these settings. Lower the minimum games or use a shorter lookback window.")
+        run_ml_predictions = st.button("Generate / Refresh ML Predictions", type="primary", key="run_ml_predictions_button")
+        if run_ml_predictions:
+            st.session_state["ml_predictions_have_run"] = True
+
+        if not st.session_state.get("ml_predictions_have_run", False):
+            st.info(
+                "Choose the lookback window and projection settings above, then click **Generate / Refresh ML Predictions**. "
+                "After it runs, scroll down to see the projection table, top prediction summary, similar players, and feature importance."
+            )
         else:
-            ml_models = train_random_forest_models(ml_training_df, ml_feature_cols, ML_TARGET_STATS)
-            current_rows = build_current_prediction_rows(yearly_df, ml_lookback, ml_min_games)
-
-            c4, c5, c6 = st.columns(3)
-            c4.metric("Training Examples", f"{len(ml_training_df):,}")
-            c5.metric("Features Used", f"{len(ml_feature_cols):,}")
-            c6.metric("Models Trained", f"{len(ml_models):,}")
-
-            metric_rows = []
-            for stat, info in ml_models.items():
-                metric_rows.append({"Stat": stat, "MAE": info["mae"], "R²": info["r2"]})
-            metrics_df = pd.DataFrame(metric_rows)
-            if not metrics_df.empty:
-                st.subheader("Model Accuracy Check")
-                st.caption("MAE means average miss. For example, HR MAE of 4 means the model is typically off by about 4 home runs on the test seasons.")
-                st.dataframe(clean_ui_columns(metrics_df.round({"MAE": 3, "R²": 3})), use_container_width=True, hide_index=True)
-
-            if current_rows.empty:
-                st.warning("No current players met the minimum playing-time filter for prediction.")
+            with st.spinner("Training models and generating projections..."):
+                ml_training_df, ml_feature_cols = build_ml_training_set(yearly_df, ml_lookback, ml_min_games, ML_TARGET_STATS)
+            if ml_training_df.empty or not ml_feature_cols:
+                st.warning("Not enough historical data to train the model with these settings. Lower the minimum games or use a shorter lookback window.")
             else:
-                X_current = current_rows.reindex(columns=ml_feature_cols).replace([np.inf, -np.inf], np.nan).fillna(0)
-                pred_df = current_rows[["playerID", "fullName", "bats", "last_year", "prediction_year", "age_entering_year", "hist_G_total", "hist_AB_total"]].copy()
+                ml_models = train_random_forest_models(ml_training_df, ml_feature_cols, ML_TARGET_STATS)
+                current_rows = build_current_prediction_rows(yearly_df, ml_lookback, ml_min_games)
+
+                c4, c5, c6 = st.columns(3)
+                c4.metric("Training Examples", f"{len(ml_training_df):,}")
+                c5.metric("Features Used", f"{len(ml_feature_cols):,}")
+                c6.metric("Models Trained", f"{len(ml_models):,}")
+
+                metric_rows = []
                 for stat, info in ml_models.items():
-                    pred_df[f"Predicted {stat}"] = info["model"].predict(X_current)
+                    metric_rows.append({"Stat": stat, "MAE": info["mae"], "R²": info["r2"]})
+                metrics_df = pd.DataFrame(metric_rows)
+                if not metrics_df.empty:
+                    st.subheader("Model Accuracy Check")
+                    st.caption("MAE means average miss. For example, HR MAE of 4 means the model is typically off by about 4 home runs on the test seasons.")
+                    st.dataframe(clean_ui_columns(metrics_df.round({"MAE": 3, "R²": 3})), use_container_width=True, hide_index=True)
 
-                for stat in ["R", "H", "2B", "3B", "HR", "RBI", "SB", "BB"]:
-                    col = f"Predicted {stat}"
-                    if col in pred_df.columns:
-                        pred_df[col] = pred_df[col].clip(lower=0)
-                for stat in RATE_STATS:
-                    col = f"Predicted {stat}"
-                    if col in pred_df.columns:
-                        pred_df[col] = pred_df[col].clip(lower=0, upper=1.5)
+                if current_rows.empty:
+                    st.warning("No current players met the minimum playing-time filter for prediction.")
+                else:
+                    X_current = current_rows.reindex(columns=ml_feature_cols).replace([np.inf, -np.inf], np.nan).fillna(0)
+                    pred_df = current_rows[["playerID", "fullName", "bats", "last_year", "prediction_year", "age_entering_year", "hist_G_total", "hist_AB_total"]].copy()
+                    for stat, info in ml_models.items():
+                        pred_df[f"Predicted {stat}"] = info["model"].predict(X_current)
 
-                pred_df, age_curve_df, comp_df = apply_advanced_projection_adjustments(
-                    pred_df, current_rows, ml_training_df, ml_feature_cols, ML_TARGET_STATS,
-                    regression_strength=regression_strength,
-                    age_strength=age_strength,
-                    comp_weight=comp_weight,
-                    k_neighbors=k_neighbors,
-                )
+                    for stat in ["R", "H", "2B", "3B", "HR", "RBI", "SB", "BB"]:
+                        col = f"Predicted {stat}"
+                        if col in pred_df.columns:
+                            pred_df[col] = pred_df[col].clip(lower=0)
+                    for stat in RATE_STATS:
+                        col = f"Predicted {stat}"
+                        if col in pred_df.columns:
+                            pred_df[col] = pred_df[col].clip(lower=0, upper=1.5)
 
-                min_pred_ab = st.number_input("Minimum Recent AB in Lookback Window", 0, 2500, 300, key="ml_min_ab")
-                pred_df = pred_df[pd.to_numeric(pred_df["hist_AB_total"], errors="coerce") >= min_pred_ab].copy()
+                    pred_df, age_curve_df, comp_df = apply_advanced_projection_adjustments(
+                        pred_df, current_rows, ml_training_df, ml_feature_cols, ML_TARGET_STATS,
+                        regression_strength=regression_strength,
+                        age_strength=age_strength,
+                        comp_weight=comp_weight,
+                        k_neighbors=k_neighbors,
+                    )
 
-                sort_col = f"Final {ml_sort_stat}"
-                if sort_col in pred_df.columns:
-                    pred_df = pred_df.sort_values(sort_col, ascending=False)
+                    min_pred_ab = st.number_input("Minimum Recent AB in Lookback Window", 0, 2500, 300, key="ml_min_ab")
+                    pred_df = pred_df[pd.to_numeric(pred_df["hist_AB_total"], errors="coerce") >= min_pred_ab].copy()
 
-                display_cols = [
-                    "fullName", "bats", "prediction_year", "age_entering_year", "hist_G_total", "hist_AB_total", "Similar Players",
-                    "Final R", "Final H", "Final 2B", "Final 3B", "Final HR", "Final RBI", "Final SB", "Final BB",
-                    "Final BA", "Final OBP", "Final SLG", "Final OPS",
-                    "Predicted R", "Predicted H", "Predicted HR", "Predicted RBI", "Predicted SB", "Predicted OPS"
-                ]
-                display_cols = [c for c in display_cols if c in pred_df.columns]
-                ml_display = clean_ui_columns(pred_df[display_cols].rename(columns={
-                    "fullName": "Player", "bats": "Bats", "prediction_year": "Prediction Year",
-                    "age_entering_year": "Age", "hist_G_total": "Recent Games", "hist_AB_total": "Recent AB"
-                }))
+                    if pred_df.empty:
+                        st.warning("No players met the Recent AB filter. Lower **Minimum Recent AB in Lookback Window** or lower **Minimum Games in Lookback Window** above, then generate again.")
+                    else:
+                        st.success(f"Generated {len(pred_df):,} player projections. Scroll down to view the table.")
 
-                st.subheader("Next-Season Advanced ML Projections")
-                for _col in ml_display.columns:
-                    if _col.startswith(("Predicted ", "Final ")):
-                        _stat = _col.replace("Predicted ", "").replace("Final ", "")
-                        ml_display[_col] = pd.to_numeric(ml_display[_col], errors="coerce").round(3 if _stat in RATE_STATS else 0)
-                for _col in ["Age", "Recent Games", "Recent AB"]:
-                    if _col in ml_display.columns:
-                        ml_display[_col] = pd.to_numeric(ml_display[_col], errors="coerce").round(0)
-                st.dataframe(ml_display, use_container_width=True, hide_index=True)
+                    sort_col = f"Final {ml_sort_stat}"
+                    if sort_col in pred_df.columns:
+                        pred_df = pred_df.sort_values(sort_col, ascending=False)
 
-                if not ml_display.empty:
-                    st.subheader("Top Prediction Summary")
-                    st.success(make_ml_prediction_summary(ml_display.iloc[0], ml_sort_stat))
+                    display_cols = [
+                        "fullName", "bats", "prediction_year", "age_entering_year", "hist_G_total", "hist_AB_total", "Similar Players",
+                        "Final R", "Final H", "Final 2B", "Final 3B", "Final HR", "Final RBI", "Final SB", "Final BB",
+                        "Final BA", "Final OBP", "Final SLG", "Final OPS",
+                        "Predicted R", "Predicted H", "Predicted HR", "Predicted RBI", "Predicted SB", "Predicted OPS"
+                    ]
+                    display_cols = [c for c in display_cols if c in pred_df.columns]
+                    ml_display = clean_ui_columns(pred_df[display_cols].rename(columns={
+                        "fullName": "Player", "bats": "Bats", "prediction_year": "Prediction Year",
+                        "age_entering_year": "Age", "hist_G_total": "Recent Games", "hist_AB_total": "Recent AB"
+                    }))
 
-                with st.expander("Show age curve and similar-player details"):
-                    st.write("The age curve estimates how players historically changed from their most recent season to the following season at each age. Similar-player comps compare each player's recent profile to past players with similar age and statistics.")
-                    if not age_curve_df.empty:
-                        age_stats = [s for s in ML_TARGET_STATS if s in age_curve_df["Stat"].unique()]
-                        if age_stats:
-                            age_view_stat = st.selectbox("Age Curve Stat", age_stats, index=0, key="ml_age_curve_stat")
-                            age_view = age_curve_df[age_curve_df["Stat"] == age_view_stat].rename(columns={"Age Adjustment": "Expected Age Change"})
-                            st.dataframe(age_view.style.format({"Expected Age Change": "{:.4f}"}), use_container_width=True, hide_index=True)
-                    if "Similar Players" in pred_df.columns:
-                        comps_display = pred_df[["fullName", "age_entering_year", "Similar Player Sample", "Similar Players"]].rename(columns={"fullName": "Player", "age_entering_year": "Age"}).head(25)
-                        st.dataframe(clean_ui_columns(comps_display), use_container_width=True, hide_index=True)
+                    st.subheader("Next-Season Advanced ML Projections")
+                    for _col in ml_display.columns:
+                        if _col.startswith(("Predicted ", "Final ")):
+                            _stat = _col.replace("Predicted ", "").replace("Final ", "")
+                            ml_display[_col] = pd.to_numeric(ml_display[_col], errors="coerce").round(3 if _stat in RATE_STATS else 0)
+                    for _col in ["Age", "Recent Games", "Recent AB"]:
+                        if _col in ml_display.columns:
+                            ml_display[_col] = pd.to_numeric(ml_display[_col], errors="coerce").round(0)
+                    st.dataframe(ml_display, use_container_width=True, hide_index=True)
 
-                st.subheader("What Stats Matter Most?")
-                importance_options = [s for s in ML_TARGET_STATS if s in ml_models]
-                if importance_options:
-                    importance_stat = st.selectbox("Feature Importance For", importance_options, index=0, key="ml_importance_stat")
-                    importance_df = ml_models[importance_stat]["importance"].head(15).copy()
-                    importance_df["Feature"] = importance_df["Feature"].apply(clean_feature_name)
-                    st.dataframe(clean_ui_columns(importance_df).style.format({"Importance": "{:.4f}"}), use_container_width=True, hide_index=True)
-                    top_bar_chart(importance_df, "Feature", "Importance", f"Top Feature Importance for Predicting {importance_stat}", top_n=15)
+                    if not ml_display.empty:
+                        st.subheader("Top Prediction Summary")
+                        st.success(make_ml_prediction_summary(ml_display.iloc[0], ml_sort_stat))
 
-                st.info(
-                    "How to explain this in an interview: I turned baseball history into a supervised ML projection problem. "
-                    "For each player-season, the input is the previous 3–5 years of production, age, recent averages, and trend slopes. "
-                    "The target is the next season. I use Random Forest for nonlinear prediction, then improve stability with regression-to-the-mean, "
-                    "a learned aging curve, and a similar-player nearest-neighbor blend."
-                )
+                    with st.expander("Show age curve and similar-player details"):
+                        st.write("The age curve estimates how players historically changed from their most recent season to the following season at each age. Similar-player comps compare each player's recent profile to past players with similar age and statistics.")
+                        if not age_curve_df.empty:
+                            age_stats = [s for s in ML_TARGET_STATS if s in age_curve_df["Stat"].unique()]
+                            if age_stats:
+                                age_view_stat = st.selectbox("Age Curve Stat", age_stats, index=0, key="ml_age_curve_stat")
+                                age_view = age_curve_df[age_curve_df["Stat"] == age_view_stat].rename(columns={"Age Adjustment": "Expected Age Change"})
+                                st.dataframe(age_view.style.format({"Expected Age Change": "{:.4f}"}), use_container_width=True, hide_index=True)
+                        if "Similar Players" in pred_df.columns:
+                            comps_display = pred_df[["fullName", "age_entering_year", "Similar Player Sample", "Similar Players"]].rename(columns={"fullName": "Player", "age_entering_year": "Age"}).head(25)
+                            st.dataframe(clean_ui_columns(comps_display), use_container_width=True, hide_index=True)
+
+                    st.subheader("What Stats Matter Most?")
+                    importance_options = [s for s in ML_TARGET_STATS if s in ml_models]
+                    if importance_options:
+                        importance_stat = st.selectbox("Feature Importance For", importance_options, index=0, key="ml_importance_stat")
+                        importance_df = ml_models[importance_stat]["importance"].head(15).copy()
+                        importance_df["Feature"] = importance_df["Feature"].apply(clean_feature_name)
+                        st.dataframe(clean_ui_columns(importance_df).style.format({"Importance": "{:.4f}"}), use_container_width=True, hide_index=True)
+                        top_bar_chart(importance_df, "Feature", "Importance", f"Top Feature Importance for Predicting {importance_stat}", top_n=15)
+
+                    st.info(
+                        "How to explain this in an interview: I turned baseball history into a supervised ML projection problem. "
+                        "For each player-season, the input is the previous 3–5 years of production, age, recent averages, and trend slopes. "
+                        "The target is the next season. I use Random Forest for nonlinear prediction, then improve stability with regression-to-the-mean, "
+                        "a learned aging curve, and a similar-player nearest-neighbor blend."
+                    )
 
 st.caption("Built with Streamlit, Pandas, and Matplotlib using People.csv, Batting.csv, and Fielding.csv.")
