@@ -1396,10 +1396,14 @@ with tab_trend:
         c5m.metric(f"Average {selected_trend_name} Trend", fmt_count_1(selected_values.mean()))
 
     trend_sorted = clean_ui_columns(trend_display.sort_values(sort_col, ascending=False))
-    styled_trend = trend_sorted.style.map(color_trend, subset=TREND_COUNT_COLS + TREND_RATE_COLS).format({**{col: "{:.1f}" for col in TREND_COUNT_COLS}, **{col: "{:.4f}" for col in TREND_RATE_COLS}})
     st.subheader("Trend Table")
-    st.dataframe(styled_trend, use_container_width=True, hide_index=True)
-
+    st.caption("Showing the top 1,000 rows for speed. Use filters to narrow the table further.")
+    trend_sorted_display = format_display_table(
+        trend_sorted.head(1000),
+        count_cols=[c for c in TREND_COUNT_COLS if c in trend_sorted.columns],
+        rate_cols=[c for c in TREND_RATE_COLS if c in trend_sorted.columns],
+    )
+    st.dataframe(trend_sorted_display, use_container_width=True, hide_index=True)
     breakout_df = trend_value_df[["fullName", "bats", "OPS_trend", "HR_trend", "XBH_noHR_trend", "RBI_trend", "SB_trend"]].copy()
     top_breakouts = breakout_df.sort_values("OPS_trend", ascending=False).head(10)
     biggest_declines = breakout_df.sort_values("OPS_trend", ascending=True).head(10)
@@ -1411,10 +1415,10 @@ with tab_trend:
     c3, c4 = st.columns(2)
     with c3:
         st.subheader("🔥 Top Breakout Players")
-        st.dataframe(top_breakouts_display.style.map(color_trend, subset=["OPS Δ", "HR Δ", "2B+3B Δ", "RBI Δ", "SB Δ"]).format({"OPS Δ": "{:.4f}", "HR Δ": "{:.1f}", "2B+3B Δ": "{:.1f}", "RBI Δ": "{:.1f}", "SB Δ": "{:.1f}"}), use_container_width=True, hide_index=True)
+        st.dataframe(format_display_table(top_breakouts_display, count_cols=["HR Δ", "2B+3B Δ", "RBI Δ", "SB Δ"], rate_cols=["OPS Δ"]), use_container_width=True, hide_index=True)
     with c4:
         st.subheader("❄️ Biggest Declines")
-        st.dataframe(biggest_declines_display.style.map(color_trend, subset=["OPS Δ", "HR Δ", "2B+3B Δ", "RBI Δ", "SB Δ"]).format({"OPS Δ": "{:.4f}", "HR Δ": "{:.1f}", "2B+3B Δ": "{:.1f}", "RBI Δ": "{:.1f}", "SB Δ": "{:.1f}"}), use_container_width=True, hide_index=True)
+        st.dataframe(format_display_table(biggest_declines_display, count_cols=["HR Δ", "2B+3B Δ", "RBI Δ", "SB Δ"], rate_cols=["OPS Δ"]), use_container_width=True, hide_index=True)
 
     st.subheader("Insight Summaries")
     top_breakout_row = trend_value_df.sort_values("OPS_trend", ascending=False).head(1)
@@ -1656,7 +1660,7 @@ with tab_ml:
                             if age_stats:
                                 age_view_stat = st.selectbox("Age Curve Stat", age_stats, index=0, key="ml_age_curve_stat")
                                 age_view = age_curve_df[age_curve_df["Stat"] == age_view_stat].rename(columns={"Age Adjustment": "Expected Age Change"})
-                                st.dataframe(age_view.style.format({"Expected Age Change": "{:.4f}"}), use_container_width=True, hide_index=True)
+                                st.dataframe(format_display_table(age_view, rate_cols=["Expected Age Change"]), use_container_width=True, hide_index=True)
                         if "Similar Players" in pred_df.columns:
                             comps_display = pred_df[["fullName", "age_entering_year", "Similar Player Sample", "Similar Players"]].rename(columns={"fullName": "Player", "age_entering_year": "Age"}).head(25)
                             st.dataframe(clean_ui_columns(comps_display), use_container_width=True, hide_index=True)
@@ -1667,7 +1671,7 @@ with tab_ml:
                         importance_stat = st.selectbox("Feature Importance For", importance_options, index=0, key="ml_importance_stat")
                         importance_df = ml_models[importance_stat]["importance"].head(15).copy()
                         importance_df["Feature"] = importance_df["Feature"].apply(clean_feature_name)
-                        st.dataframe(clean_ui_columns(importance_df).style.format({"Importance": "{:.4f}"}), use_container_width=True, hide_index=True)
+                        st.dataframe(format_display_table(clean_ui_columns(importance_df), rate_cols=["Importance"]), use_container_width=True, hide_index=True)
                         top_bar_chart(importance_df, "Feature", "Importance", f"Top Feature Importance for Predicting {importance_stat}", top_n=15)
 
                     st.info(
