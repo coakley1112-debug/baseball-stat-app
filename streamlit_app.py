@@ -80,12 +80,33 @@ team_id_to_historical_name = {
     "ML1": "Milwaukee Braves", "BSN": "Boston Braves"
 }
 
+
+# Lightweight team/league context features for ML. These are modern-franchise approximations
+# designed to add context without requiring extra external park-factor files.
+AL_TEAMS = {"BAL", "BOS", "NYY", "TBR", "TOR", "CWS", "CLE", "DET", "KCR", "MIN", "HOU", "LAA", "OAK", "SEA", "TEX"}
+NL_TEAMS = {"ATL", "MIA", "NYM", "PHI", "WAS", "CHC", "CIN", "MIL", "PIT", "STL", "ARI", "COL", "LAD", "SDP", "SFG"}
+TEAM_PARK_FACTOR = {
+    "COL": 1.15, "BOS": 1.06, "CIN": 1.05, "NYY": 1.04, "PHI": 1.04, "BAL": 1.03,
+    "HOU": 1.02, "TEX": 1.02, "ATL": 1.01, "CHC": 1.01, "LAD": 1.00, "NYM": 1.00,
+    "TOR": 1.00, "STL": 0.99, "MIL": 0.99, "ARI": 0.99, "SDP": 0.98, "SFG": 0.97,
+    "SEA": 0.97, "DET": 0.97, "MIA": 0.96, "OAK": 0.95, "PIT": 0.98, "CLE": 0.99,
+    "KCR": 0.99, "MIN": 0.99, "CWS": 1.00, "TBR": 1.00, "WAS": 1.00, "LAA": 1.00
+}
+
+def team_league(team_id):
+    if team_id in AL_TEAMS:
+        return "AL"
+    if team_id in NL_TEAMS:
+        return "NL"
+    return "Unknown"
+
 COUNT_STATS = ["R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "G"]
 RATE_STATS = ["BA", "OBP", "SLG", "OPS"]
 TREND_COUNT_COLS = ["R Δ", "H Δ", "2B Δ", "3B Δ", "HR Δ", "RBI Δ", "SB Δ", "BB Δ"]
 TREND_RATE_COLS = ["BA Δ", "OBP Δ", "SLG Δ", "OPS Δ"]
 ML_TARGET_STATS = ["R", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "BA", "OBP", "SLG", "OPS"]
-ML_BASE_FEATURE_STATS = ["G", "AB", "R", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "BA", "OBP", "SLG", "OPS"]
+ML_BASE_FEATURE_STATS = ["G", "AB", "R", "H", "2B", "3B", "HR", "RBI", "SB", "CS", "BB", "SO", "BA", "OBP", "SLG", "OPS"]
+ML_DERIVED_FEATURE_STATS = ["PA_est", "BB_rate", "K_rate", "SB_rate", "XBH", "XBH_rate", "HR_rate", "Speed_Index"]
 
 st.set_page_config(page_title="⚾ Daniel Cohen Baseball Explorer ⚾", layout="wide")
 
@@ -403,15 +424,75 @@ def add_latest_and_projection_columns(base_df, recent_data):
     df["proj_OPS"] = df["latest_OPS"] + df["OPS_trend"]
     return df
 
-def build_ml_training_set(yearly_source, lookback_years=3, min_games_per_window=50, target_stats=None):
-    """Create supervised learning rows: last N years of stats -> following year stats."""
-    target_stats = target_stats or ML_TARGET_STATS
-    df = yearly_source.copy().sort_values(["playerID", "yearID"])
+
+@st.cache_data(show_spinner=False)
+def prepare_ml_yearly_source(yearly_source):
+    """Add ML-ready context and derived features once, then cache it.
+
+    This function is intentionally cached because it is used by both training-row creation
+    and current-player projection creation.
+    """
+    df = yearly_source.copy()
     for col in ["yearID", "birthYear", "birthMonth", "birthDay"] + ML_BASE_FEATURE_STATS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["G", "AB", "R", "H", "2B", "3B", "HR", "RBI", "SB", "CS", "BB", "SO"]:
+        if col not in df.columns:
+            df[col] = 0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    df["PA_est"] = df["AB"] + df["BB"]
+    safe_pa = df["PA_est"].replace(0, np.nan)
+    safe_ab = df["AB"].replace(0, np.nan)
+    steal_attempts = (df["SB"] + df["CS"]).replace(0, np.nan)
+    df["BB_rate"] = (df["BB"] / safe_pa).fillna(0)
+    df["K_rate"] = (df["SO"] / safe_pa).fillna(0)
+    df["SB_rate"] = (df["SB"] / steal_attempts).fillna(0)
+    df["XBH"] = df["2B"] + df["3B"] + df["HR"]
+    df["XBH_rate"] = (df["XBH"] / safe_ab).fillna(0)
+    df["HR_rate"] = (df["HR"] / safe_ab).fillna(0)
+    df["Speed_Index"] = (df["SB"] + 2 * df["3B"]) / df["G"].replace(0, np.nan)
+    df["Speed_Index"] = df["Speed_Index"].fillna(0)
+    df["bats"] = df.get("bats", "Unknown").fillna("Unknown").replace({"": "Unknown"})
+    df["primaryPos"] = df.get("primaryPos", "DH").fillna("DH").replace({"": "DH"})
+    df["careerPrimaryPos"] = df.get("careerPrimaryPos", df["primaryPos"]).fillna(df["primaryPos"]).replace({"": "DH"})
+    df["primaryTeamID"] = df.get("primaryTeamID", "UNK").fillna("UNK").replace({"": "UNK"})
+    df["League"] = df["primaryTeamID"].apply(team_league)
+    df["Park_Factor"] = df["primaryTeamID"].map(TEAM_PARK_FACTOR).fillna(1.0)
+    return df.sort_values(["playerID", "yearID"]).reset_index(drop=True)
+
+
+def add_context_dummy_features(row, source_row):
+    """Add low-cardinality categorical features as numeric dummy variables."""
+    bats = str(source_row.get("bats", "Unknown") or "Unknown")
+    pos = str(source_row.get("primaryPos", "DH") or "DH")
+    league = str(source_row.get("League", "Unknown") or "Unknown")
+    team = str(source_row.get("primaryTeamID", "UNK") or "UNK")
+    for b in ["L", "R", "B", "Unknown"]:
+        row[f"bats_{b}"] = 1 if bats == b else 0
+    for p in ["C", "1B", "2B", "3B", "SS", "OF", "P", "DH"]:
+        row[f"pos_{p}"] = 1 if pos == p else 0
+    for lg in ["AL", "NL", "Unknown"]:
+        row[f"league_{lg}"] = 1 if league == lg else 0
+    # Keep team as broad context without allowing hundreds of sparse old team codes.
+    for t in sorted(AL_TEAMS | NL_TEAMS):
+        row[f"team_{t}"] = 1 if team == t else 0
+    row["Park_Factor"] = pd.to_numeric(source_row.get("Park_Factor", 1.0), errors="coerce")
+    return row
+
+
+@st.cache_data(show_spinner=False)
+def build_ml_training_set(yearly_source, lookback_years=3, min_games_per_window=50, target_stats_tuple=tuple(ML_TARGET_STATS)):
+    """Create supervised learning rows: last N years of features -> following-year stats.
+
+    Added features include age/age², bats, primary position, team, league, park factor,
+    recent stats, rolling means, trend slopes, playing time, walk rate, strikeout rate,
+    OPS, and speed/durability proxies.
+    """
+    target_stats = list(target_stats_tuple)
+    df = prepare_ml_yearly_source(yearly_source)
     rows = []
-    for player_id, g in df.groupby("playerID"):
+    all_feature_stats = ML_BASE_FEATURE_STATS + ML_DERIVED_FEATURE_STATS
+    for player_id, g in df.groupby("playerID", sort=False):
         g = g.sort_values("yearID").reset_index(drop=True)
         for idx in range(lookback_years, len(g)):
             history = g.iloc[idx - lookback_years:idx]
@@ -422,19 +503,33 @@ def build_ml_training_set(yearly_source, lookback_years=3, min_games_per_window=
             if pd.to_numeric(history["G"], errors="coerce").sum() < min_games_per_window:
                 continue
             birth_year = pd.to_numeric(target.get("birthYear", np.nan), errors="coerce")
+            age = baseball_age_for_season(target["yearID"], birth_year, target.get("birthMonth", np.nan), target.get("birthDay", np.nan))
             row = {
                 "playerID": player_id,
                 "fullName": target.get("fullName", ""),
                 "bats": target.get("bats", ""),
+                "primaryPos": target.get("primaryPos", ""),
+                "League": target.get("League", "Unknown"),
+                "primaryTeamID": target.get("primaryTeamID", "UNK"),
                 "predict_year": int(target["yearID"]),
                 "last_year": int(target["yearID"]) - 1,
-                "age_entering_year": baseball_age_for_season(target["yearID"], birth_year, target.get("birthMonth", np.nan), target.get("birthDay", np.nan)),
+                "age_entering_year": age,
+                "age_squared": age ** 2 if pd.notna(age) else np.nan,
                 "hist_G_total": pd.to_numeric(history["G"], errors="coerce").sum(),
                 "hist_AB_total": pd.to_numeric(history["AB"], errors="coerce").sum(),
+                "durability_3yr_avg_G": pd.to_numeric(history["G"], errors="coerce").mean(),
+                "durability_3yr_min_G": pd.to_numeric(history["G"], errors="coerce").min(),
             }
-            for stat in ML_BASE_FEATURE_STATS:
-                values = pd.to_numeric(history[stat], errors="coerce")
+            row = add_context_dummy_features(row, target)
+            # weighted recency: latest year gets the largest weight
+            weights = np.arange(1, len(history) + 1, dtype=float)
+            weights = weights / weights.sum()
+            for stat in all_feature_stats:
+                if stat not in history.columns:
+                    continue
+                values = pd.to_numeric(history[stat], errors="coerce").fillna(0)
                 row[f"{stat}_mean_{lookback_years}yr"] = values.mean()
+                row[f"{stat}_weighted_recent"] = float(np.dot(values.to_numpy(), weights))
                 row[f"{stat}_last"] = values.iloc[-1]
                 row[f"{stat}_trend"] = compute_trend_slope(history, stat)
             for stat in target_stats:
@@ -443,16 +538,20 @@ def build_ml_training_set(yearly_source, lookback_years=3, min_games_per_window=
     ml_df = pd.DataFrame(rows)
     if ml_df.empty:
         return ml_df, []
-    feature_cols = [c for c in ml_df.columns if c not in ["playerID", "fullName", "bats", "predict_year", "last_year"] and not c.startswith("target_")]
+    exclude = {"playerID", "fullName", "bats", "primaryPos", "League", "primaryTeamID", "predict_year", "last_year"}
+    feature_cols = [c for c in ml_df.columns if c not in exclude and not c.startswith("target_")]
     ml_df[feature_cols] = ml_df[feature_cols].apply(pd.to_numeric, errors="coerce")
     target_cols = [f"target_{stat}" for stat in target_stats]
     ml_df[target_cols] = ml_df[target_cols].apply(pd.to_numeric, errors="coerce")
     ml_df = ml_df.dropna(subset=target_cols, how="all")
     return ml_df, feature_cols
 
-@st.cache_data(show_spinner=False)
-def train_random_forest_models(ml_training_df, feature_cols, target_stats, random_state=42):
-    """Train one Random Forest per stat, so each stat has its own accuracy and feature importance."""
+
+@st.cache_resource(show_spinner=False)
+def train_random_forest_models(ml_training_df, feature_cols_tuple, target_stats_tuple=tuple(ML_TARGET_STATS), random_state=42):
+    """Train compact Random Forest models once and cache them for Streamlit Cloud speed."""
+    target_stats = list(target_stats_tuple)
+    feature_cols = list(feature_cols_tuple)
     results = {}
     if ml_training_df.empty or not feature_cols:
         return results
@@ -471,17 +570,94 @@ def train_random_forest_models(ml_training_df, feature_cols, target_stats, rando
             X_train, X_test, y_train, y_test = train_test_split(X_valid, y_valid, test_size=0.25, random_state=random_state)
         else:
             X_train, X_test, y_train, y_test = X_valid, X_valid, y_valid, y_valid
-        model = RandomForestRegressor(n_estimators=100, max_depth=8, min_samples_leaf=5, random_state=random_state, n_jobs=1)
+        model = RandomForestRegressor(
+            n_estimators=50,
+            max_depth=10,
+            min_samples_leaf=8,
+            max_features="sqrt",
+            random_state=random_state,
+            n_jobs=-1,
+        )
         model.fit(X_train, y_train)
         preds = model.predict(X_test)
         importances = pd.DataFrame({"Feature": feature_cols, "Importance": model.feature_importances_}).sort_values("Importance", ascending=False)
-        results[stat] = {"model": model, "mae": float(mean_absolute_error(y_test, preds)), "r2": float(r2_score(y_test, preds)) if len(y_test) > 1 else np.nan, "importance": importances}
+        results[stat] = {
+            "model": model,
+            "mae": float(mean_absolute_error(y_test, preds)),
+            "r2": float(r2_score(y_test, preds)) if len(y_test) > 1 else np.nan,
+            "importance": importances,
+        }
     return results
 
 
+@st.cache_data(show_spinner=False)
+def build_current_prediction_rows(yearly_source, lookback_years=3, min_games_per_window=50, max_player_pool=750):
+    """Create one current row per active/recent player using each player's true max(yearID).
+
+    Optimized for Streamlit Cloud:
+    - only active/recent players are projected
+    - optional cap on player pool, sorted by recent AB
+    - feature construction mirrors training features exactly
+    """
+    df = prepare_ml_yearly_source(yearly_source)
+    df = df.dropna(subset=["playerID", "yearID"]).copy()
+    df["yearID"] = df["yearID"].astype(int)
+    max_data_year = int(df["yearID"].max())
+    rows = []
+    all_feature_stats = ML_BASE_FEATURE_STATS + ML_DERIVED_FEATURE_STATS
+    for player_id, g in df.groupby("playerID", sort=False):
+        g = g.sort_values("yearID").reset_index(drop=True)
+        latest_year = int(g["yearID"].max())
+        if latest_year < max_data_year - 1:
+            continue
+        latest = g[g["yearID"] == latest_year].iloc[0]
+        history = g[g["yearID"] <= latest_year].tail(lookback_years).copy()
+        if len(history) < lookback_years:
+            continue
+        expected_years = list(range(latest_year - lookback_years + 1, latest_year + 1))
+        if history["yearID"].astype(int).tolist() != expected_years:
+            continue
+        if pd.to_numeric(history["G"], errors="coerce").sum() < min_games_per_window:
+            continue
+        birth_year = pd.to_numeric(latest.get("birthYear", np.nan), errors="coerce")
+        age = baseball_age_for_season(latest_year + 1, birth_year, latest.get("birthMonth", np.nan), latest.get("birthDay", np.nan))
+        row = {
+            "playerID": player_id,
+            "fullName": latest.get("fullName", ""),
+            "bats": latest.get("bats", ""),
+            "primaryPos": latest.get("primaryPos", ""),
+            "League": latest.get("League", "Unknown"),
+            "primaryTeamID": latest.get("primaryTeamID", "UNK"),
+            "last_year": latest_year,
+            "prediction_year": latest_year + 1,
+            "age_entering_year": age,
+            "age_squared": age ** 2 if pd.notna(age) else np.nan,
+            "hist_G_total": pd.to_numeric(history["G"], errors="coerce").sum(),
+            "hist_AB_total": pd.to_numeric(history["AB"], errors="coerce").sum(),
+            "durability_3yr_avg_G": pd.to_numeric(history["G"], errors="coerce").mean(),
+            "durability_3yr_min_G": pd.to_numeric(history["G"], errors="coerce").min(),
+        }
+        row = add_context_dummy_features(row, latest)
+        for stat in ML_BASE_FEATURE_STATS:
+            row[f"Last {stat}"] = pd.to_numeric(latest.get(stat, np.nan), errors="coerce")
+        weights = np.arange(1, len(history) + 1, dtype=float)
+        weights = weights / weights.sum()
+        for stat in all_feature_stats:
+            if stat not in history.columns:
+                continue
+            values = pd.to_numeric(history[stat], errors="coerce").fillna(0)
+            row[f"{stat}_mean_{lookback_years}yr"] = values.mean()
+            row[f"{stat}_weighted_recent"] = float(np.dot(values.to_numpy(), weights))
+            row[f"{stat}_last"] = values.iloc[-1]
+            row[f"{stat}_trend"] = compute_trend_slope(history, stat)
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    if not out.empty and max_player_pool:
+        out = out.sort_values("hist_AB_total", ascending=False).head(int(max_player_pool)).reset_index(drop=True)
+    return out
+
 
 def get_target_baselines(ml_training_df, target_stats):
-    """League-wide historical next-year averages, used for regression-to-the-mean."""
     baselines = {}
     for stat in target_stats:
         col = f"target_{stat}"
@@ -490,11 +666,10 @@ def get_target_baselines(ml_training_df, target_stats):
     return baselines
 
 
-def get_age_curve_adjustments(ml_training_df, target_stats):
-    """
-    Estimate aging effects from historical training rows.
-    For each age and stat, compare the following-year result to the player's most recent season.
-    """
+@st.cache_data(show_spinner=False)
+def get_age_curve_adjustments(ml_training_df, target_stats_tuple=tuple(ML_TARGET_STATS)):
+    """Estimate aging effects from historical training rows."""
+    target_stats = list(target_stats_tuple)
     rows = []
     if ml_training_df.empty or "age_entering_year" not in ml_training_df.columns:
         return pd.DataFrame(columns=["Stat", "Age", "Age Adjustment"])
@@ -531,27 +706,62 @@ def lookup_age_adjustment(age_curve_df, stat, age):
     return float(stat_curve.sort_values("age_distance").iloc[0]["Age Adjustment"])
 
 
-def build_similar_player_predictions(current_rows, ml_training_df, feature_cols, target_stats, k_neighbors=25, max_age_gap=3):
-    """Compare current profiles to historical profiles, then average those players' next seasons."""
+@st.cache_data(show_spinner=False)
+def build_base_ml_predictions(yearly_source, lookback_years, min_games_per_window, max_player_pool=750):
+    """Train once, predict once, and return reusable base objects for fast UI filtering."""
+    target_stats_tuple = tuple(ML_TARGET_STATS)
+    ml_training_df, feature_cols = build_ml_training_set(yearly_source, lookback_years, min_games_per_window, target_stats_tuple)
+    if ml_training_df.empty or not feature_cols:
+        return ml_training_df, [], {}, pd.DataFrame(), pd.DataFrame()
+    feature_cols_tuple = tuple(feature_cols)
+    ml_models = train_random_forest_models(ml_training_df, feature_cols_tuple, target_stats_tuple)
+    current_rows = build_current_prediction_rows(yearly_source, lookback_years, min_games_per_window, max_player_pool=max_player_pool)
+    if current_rows.empty:
+        return ml_training_df, feature_cols, ml_models, current_rows, pd.DataFrame()
+    X_current = current_rows.reindex(columns=feature_cols).replace([np.inf, -np.inf], np.nan).fillna(0)
+    base_pred_cols = ["playerID", "fullName", "bats", "primaryPos", "League", "primaryTeamID", "last_year", "prediction_year", "age_entering_year", "hist_G_total", "hist_AB_total"]
+    last_audit_cols = [f"Last {s}" for s in ML_BASE_FEATURE_STATS if f"Last {s}" in current_rows.columns]
+    pred_df = current_rows[[c for c in base_pred_cols + last_audit_cols if c in current_rows.columns]].copy()
+    for stat, info in ml_models.items():
+        pred_df[f"Raw ML {stat}"] = info["model"].predict(X_current)
+    return ml_training_df, feature_cols, ml_models, current_rows, pred_df
+
+
+@st.cache_data(show_spinner=False)
+def build_similar_player_predictions(current_rows, ml_training_df, feature_cols_tuple, target_stats_tuple=tuple(ML_TARGET_STATS), k_neighbors=25, max_age_gap=3):
+    """Fast nearest-neighbor comps. Excludes the target player from his own comps."""
+    feature_cols = list(feature_cols_tuple)
+    target_stats = list(target_stats_tuple)
     if current_rows.empty or ml_training_df.empty or not feature_cols:
         return pd.DataFrame()
-    train_X = ml_training_df.reindex(columns=feature_cols).replace([np.inf, -np.inf], np.nan).fillna(0).astype(float)
-    current_X = current_rows.reindex(columns=feature_cols).replace([np.inf, -np.inf], np.nan).fillna(0).astype(float)
+    # Use a smaller, high-signal subset for similarity to avoid slow/noisy hundreds-column distances.
+    preferred = [
+        "age_entering_year", "age_squared", "hist_G_total", "hist_AB_total", "Park_Factor",
+        "G_last", "AB_last", "HR_last", "RBI_last", "SB_last", "BB_last", "SO_last", "OPS_last", "BA_last", "OBP_last", "SLG_last",
+        "BB_rate_last", "K_rate_last", "HR_rate_last", "XBH_rate_last", "Speed_Index_last",
+        "HR_trend", "OPS_trend", "SB_trend", "BB_rate_trend", "K_rate_trend", "Speed_Index_trend",
+    ]
+    sim_cols = [c for c in preferred if c in feature_cols]
+    if len(sim_cols) < 5:
+        sim_cols = feature_cols[:30]
+    train_X = ml_training_df.reindex(columns=sim_cols).replace([np.inf, -np.inf], np.nan).fillna(0).astype(float)
+    current_X = current_rows.reindex(columns=sim_cols).replace([np.inf, -np.inf], np.nan).fillna(0).astype(float)
     means = train_X.mean(axis=0)
     stds = train_X.std(axis=0).replace(0, 1)
     train_Z = ((train_X - means) / stds).to_numpy()
     current_Z = ((current_X - means) / stds).to_numpy()
     train_ages = pd.to_numeric(ml_training_df.get("age_entering_year", np.nan), errors="coerce").to_numpy()
     current_ages = pd.to_numeric(current_rows.get("age_entering_year", np.nan), errors="coerce").to_numpy()
+    train_player_ids = ml_training_df.get("playerID", pd.Series([""] * len(ml_training_df))).astype(str).to_numpy()
     out_rows = []
-    for i, row in current_rows.reset_index(drop=True).iterrows():
-        distances = np.sqrt(np.sum((train_Z - current_Z[i]) ** 2, axis=1))
+    current_reset = current_rows.reset_index(drop=True)
+    for i, row in current_reset.iterrows():
+        diff = train_Z - current_Z[i]
+        distances = np.sqrt(np.einsum("ij,ij->i", diff, diff))
         age = current_ages[i] if i < len(current_ages) else np.nan
         candidate_mask = np.ones(len(distances), dtype=bool)
-        # Do not allow the target player to be used as his own similar-player comp.
-        # The same player may appear in historical training rows from prior seasons, but comps should be other players.
-        if "playerID" in ml_training_df.columns and pd.notna(row.get("playerID")):
-            candidate_mask &= (ml_training_df["playerID"].astype(str).to_numpy() != str(row.get("playerID")))
+        if pd.notna(row.get("playerID")):
+            candidate_mask &= (train_player_ids != str(row.get("playerID")))
         if pd.notna(age):
             age_mask = np.abs(train_ages - age) <= max_age_gap
             if (candidate_mask & age_mask).sum() >= max(k_neighbors, 10):
@@ -564,7 +774,7 @@ def build_similar_player_predictions(current_rows, ml_training_df, feature_cols,
         out = {
             "playerID": row.get("playerID"),
             "Similar Player Sample": len(comps),
-            "Similar Players": ", ".join(comps["fullName"].dropna().astype(str).head(5).tolist())
+            "Similar Players": ", ".join(comps["fullName"].dropna().astype(str).head(5).tolist()),
         }
         for stat in target_stats:
             tcol = f"target_{stat}"
@@ -576,21 +786,21 @@ def build_similar_player_predictions(current_rows, ml_training_df, feature_cols,
 
 def apply_advanced_projection_adjustments(pred_df, current_rows, ml_training_df, feature_cols, target_stats,
                                           regression_strength=0.20, age_strength=0.50, comp_weight=0.25, k_neighbors=25):
-    """Blend Random Forest, similar-player comps, age curve, and regression-to-the-mean."""
+    """Blend compact RF output, similar-player comps, age curve, and regression-to-the-mean."""
     if pred_df.empty:
         return pred_df, pd.DataFrame(), pd.DataFrame()
     adjusted = pred_df.copy()
     baselines = get_target_baselines(ml_training_df, target_stats)
-    age_curve_df = get_age_curve_adjustments(ml_training_df, target_stats)
-    comp_df = build_similar_player_predictions(current_rows, ml_training_df, feature_cols, target_stats, k_neighbors=k_neighbors)
+    age_curve_df = get_age_curve_adjustments(ml_training_df, tuple(target_stats))
+    comp_df = build_similar_player_predictions(current_rows, ml_training_df, tuple(feature_cols), tuple(target_stats), k_neighbors=k_neighbors)
     if not comp_df.empty:
         adjusted = adjusted.merge(comp_df, on="playerID", how="left")
     else:
         adjusted["Similar Player Sample"] = np.nan
         adjusted["Similar Players"] = ""
     for stat in target_stats:
-        rf_col = f"Predicted {stat}"
-        final_col = f"Final {stat}"
+        rf_col = f"Raw ML {stat}"
+        final_col = f"Predicted {stat}"
         comp_col = f"Similar {stat}"
         if rf_col not in adjusted.columns:
             continue
@@ -615,78 +825,6 @@ def apply_advanced_projection_adjustments(pred_df, current_rows, ml_training_df,
         adjusted[final_col] = final
     return adjusted, age_curve_df, comp_df
 
-def build_current_prediction_rows(yearly_source, lookback_years=3, min_games_per_window=50):
-    """Create one current row per active/recent player using the true latest season for each player.
-
-    Important bug fix:
-    - Do NOT rely on groupby().last(), iloc[-1], or row order after grouping.
-    - For every player, explicitly find latest_year = max(yearID).
-    - Pull Last HR / Last SB / Last 2B / etc. from that exact latest_year row.
-    This prevents cases like Francisco Lindor showing an older HR total when the CSV has a newer season.
-    """
-    df = yearly_source.copy()
-    for col in ["yearID", "birthYear", "birthMonth", "birthDay"] + ML_BASE_FEATURE_STATS:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["playerID", "yearID"]).copy()
-    df["yearID"] = df["yearID"].astype(int)
-    df = df.sort_values(["playerID", "yearID"]).reset_index(drop=True)
-
-    max_data_year = int(df["yearID"].max())
-    rows = []
-
-    for player_id, g in df.groupby("playerID", sort=False):
-        g = g.sort_values("yearID").reset_index(drop=True)
-        latest_year = int(g["yearID"].max())
-
-        # Keep active/recent players only. If the dataset goes through 2025, this keeps 2024/2025 players.
-        if latest_year < max_data_year - 1:
-            continue
-
-        latest_candidates = g[g["yearID"] == latest_year].copy()
-        if latest_candidates.empty:
-            continue
-        latest = latest_candidates.iloc[0]
-
-        # Use the last N available seasons ending with the exact latest year.
-        history = g[g["yearID"] <= latest_year].tail(lookback_years).copy()
-        if len(history) < lookback_years:
-            continue
-
-        # For model reliability, require the last N seasons to be consecutive.
-        expected_years = list(range(latest_year - lookback_years + 1, latest_year + 1))
-        actual_years = history["yearID"].astype(int).tolist()
-        if actual_years != expected_years:
-            continue
-
-        if pd.to_numeric(history["G"], errors="coerce").sum() < min_games_per_window:
-            continue
-
-        birth_year = pd.to_numeric(latest.get("birthYear", np.nan), errors="coerce")
-        row = {
-            "playerID": player_id,
-            "fullName": latest.get("fullName", ""),
-            "bats": latest.get("bats", ""),
-            "last_year": latest_year,
-            "prediction_year": latest_year + 1,
-            "age_entering_year": baseball_age_for_season(latest_year + 1, birth_year, latest.get("birthMonth", np.nan), latest.get("birthDay", np.nan)),
-            "hist_G_total": pd.to_numeric(history["G"], errors="coerce").sum(),
-            "hist_AB_total": pd.to_numeric(history["AB"], errors="coerce").sum(),
-        }
-
-        # Latest-season audit columns shown directly in the ML table.
-        # These are not predictions; they come from the player's exact max(yearID) row in the CSV.
-        for stat in ML_BASE_FEATURE_STATS:
-            row[f"Last {stat}"] = pd.to_numeric(latest.get(stat, np.nan), errors="coerce")
-
-        for stat in ML_BASE_FEATURE_STATS:
-            values = pd.to_numeric(history[stat], errors="coerce")
-            row[f"{stat}_mean_{lookback_years}yr"] = values.mean()
-            row[f"{stat}_last"] = values.iloc[-1]
-            row[f"{stat}_trend"] = compute_trend_slope(history, stat)
-        rows.append(row)
-
-    return pd.DataFrame(rows)
 
 def make_ml_prediction_summary(row, sort_stat):
     player = row.get("Player", "This player")
@@ -699,9 +837,8 @@ def make_ml_prediction_summary(row, sort_stat):
     return (
         f"{player}'s advanced ML projection is strongest on {sort_stat}: {stat_text}. "
         f"The model projects about {fmt_rate_3(ops)} OPS, {fmt_int(hr)} HR, {fmt_int(rbi)} RBI, and {fmt_int(sb)} SB. "
-        f"Unlike the simple trend tab, this projection blends Random Forest, age curves, similar-player history, and regression-to-the-mean."
+        f"The displayed projection blends Random Forest, age/age², position, bats, league/team context, playing time, trends, similar-player history, aging curves, and regression-to-the-mean."
     )
-
 
 
 def aggregate_player_year_team(df):
@@ -710,7 +847,7 @@ def aggregate_player_year_team(df):
         return df.copy()
     group_cols = [
         "playerID", "fullName", "bats", "throws", "birthYear", "birthMonth", "birthDay", "birthCountry",
-        "yearID", "teamID", "teamName", "teamHistoricalName", "primaryPos", "careerPrimaryPos"
+        "yearID", "teamID", "teamName", "teamHistoricalName", "teamLeague", "primaryPos", "careerPrimaryPos"
     ]
     group_cols = [c for c in group_cols if c in df.columns]
     stat_cols = [c for c in ["G", "AB", "R", "H", "2B", "3B", "HR", "RBI", "SB", "CS", "BB", "SO", "IBB", "HBP", "SH", "SF", "GIDP"] if c in df.columns]
@@ -728,8 +865,8 @@ def aggregate_player_year_primary_team(df):
     primary_team = (
         team_basis.sort_values(["playerID", "yearID", basis_col, "AB"], ascending=[True, True, False, False])
         .drop_duplicates(["playerID", "yearID"])
-        [["playerID", "yearID", "teamID", "teamName", "teamHistoricalName"]]
-        .rename(columns={"teamID": "primaryTeamID", "teamName": "primaryTeamName", "teamHistoricalName": "primaryHistoricalTeamName"})
+        [["playerID", "yearID", "teamID", "teamName", "teamHistoricalName", "teamLeague"]]
+        .rename(columns={"teamID": "primaryTeamID", "teamName": "primaryTeamName", "teamHistoricalName": "primaryHistoricalTeamName", "teamLeague": "primaryLeague"})
     )
     group_cols = [
         "playerID", "fullName", "bats", "throws", "birthYear", "birthMonth", "birthDay", "birthCountry", "careerPrimaryPos", "yearID"
@@ -847,6 +984,7 @@ def load_data():
     batting["primaryPos"] = batting["primaryPos"].fillna("DH")
     batting["careerPrimaryPos"] = batting["careerPrimaryPos"].fillna(batting["primaryPos"]).fillna("DH")
     batting["teamName"] = batting["teamID"].map(team_id_to_name).fillna(batting["teamID"])
+    batting["teamLeague"] = batting["teamID"].apply(team_league)
     batting = add_rate_stats(batting)
 
     yearly = (
@@ -856,16 +994,17 @@ def load_data():
     )
     yearly = add_rate_stats(yearly)
 
-    year_team_totals = batting.groupby(["playerID", "yearID", "teamID", "teamHistoricalName"], as_index=False).agg({"AB": "sum"})
+    year_team_totals = batting.groupby(["playerID", "yearID", "teamID", "teamHistoricalName", "teamLeague"], as_index=False).agg({"AB": "sum"})
     primary_teams = (
         year_team_totals.sort_values(["playerID", "yearID", "AB"], ascending=[True, True, False])
         .drop_duplicates(subset=["playerID", "yearID"])
-        [["playerID", "yearID", "teamID", "teamHistoricalName"]]
-        .rename(columns={"teamID": "primaryTeamID", "teamHistoricalName": "primaryHistoricalTeamName"})
+        [["playerID", "yearID", "teamID", "teamHistoricalName", "teamLeague"]]
+        .rename(columns={"teamID": "primaryTeamID", "teamHistoricalName": "primaryHistoricalTeamName", "teamLeague": "primaryLeague"})
     )
     yearly = yearly.merge(primary_teams, on=["playerID", "yearID"], how="left")
     yearly["primaryTeamName"] = yearly["primaryTeamID"].map(team_id_to_name).fillna(yearly["primaryTeamID"])
     yearly["primaryHistoricalTeamName"] = yearly["primaryHistoricalTeamName"].fillna(yearly["primaryTeamName"])
+    yearly["primaryLeague"] = yearly["primaryLeague"].fillna(yearly["primaryTeamID"].apply(team_league))
 
     yearly_pos = batting[["playerID", "yearID", "primaryPos"]].drop_duplicates(subset=["playerID", "yearID"])
     yearly = yearly.merge(yearly_pos, on=["playerID", "yearID"], how="left")
@@ -902,13 +1041,14 @@ with tab_hist:
         hist_pos = st.multiselect("Primary Position", pos_options, default=pos_options, key="hist_pos")
     with c4:
         actual_team_names = sorted(set(batting_df["teamName"].dropna().astype(str)).intersection(set(team_id_to_name.values())))
-        hist_teams = st.multiselect("Franchise", actual_team_names, default=actual_team_names, key="hist_team")
+        hist_team_options = ["All Teams", "American League", "National League"] + actual_team_names
+        hist_teams = st.multiselect("Franchise / League", hist_team_options, default=["All Teams"], key="hist_team")
 
     combine_split_seasons = st.toggle(
         "Combine split-team seasons into one primary-team row",
         value=False,
         key="hist_combine_split_seasons",
-        help="OFF = one row per player/year/team. ON = one row per player/year, with Team assigned to the team where he had the most games/AB in the filtered data."
+        help="OFF = one row per player/year/team. ON = one row per player/year, with Team assigned to the team where he had the most games/AB in that season."
     )
 
     hist_source = batting_df[(batting_df["yearID"] >= hist_year_range[0]) & (batting_df["yearID"] <= hist_year_range[1])].copy()
@@ -916,14 +1056,36 @@ with tab_hist:
         hist_source = hist_source[hist_source["bats"].isin(hist_bats)]
     if hist_pos:
         hist_source = hist_source[hist_source["primaryPos"].isin(hist_pos)]
-    if hist_teams:
-        hist_source = hist_source[hist_source["teamName"].isin(hist_teams)]
+
+    hist_selected_all = (not hist_teams) or ("All Teams" in hist_teams)
+    hist_selected_franchises = [x for x in hist_teams if x not in ["All Teams", "American League", "National League"]]
+    hist_selected_leagues = []
+    if "American League" in hist_teams:
+        hist_selected_leagues.append("AL")
+    if "National League" in hist_teams:
+        hist_selected_leagues.append("NL")
+
+    # Split-team mode: apply league/franchise filter to each actual displayed team row.
+    if not combine_split_seasons and not hist_selected_all:
+        hist_team_mask = pd.Series(False, index=hist_source.index)
+        if hist_selected_franchises:
+            hist_team_mask = hist_team_mask | hist_source["teamName"].isin(hist_selected_franchises)
+        if hist_selected_leagues:
+            hist_team_mask = hist_team_mask | hist_source["teamLeague"].isin(hist_selected_leagues)
+        hist_source = hist_source[hist_team_mask]
 
     if combine_split_seasons:
         hist = aggregate_player_year_primary_team(hist_source)
         team_col_for_display = "primaryHistoricalTeamName"
         team_sort_col = "primaryTeamName"
-        hist_note = "Combined mode: one row per player-season. Team is the primary team in the filtered data."
+        hist_note = "Combined mode: one row per player-season. Team is the primary team for that season. League filters use that primary team."
+        if not hist_selected_all and not hist.empty:
+            hist_team_mask = pd.Series(False, index=hist.index)
+            if hist_selected_franchises:
+                hist_team_mask = hist_team_mask | hist["primaryTeamName"].isin(hist_selected_franchises)
+            if hist_selected_leagues and "primaryLeague" in hist.columns:
+                hist_team_mask = hist_team_mask | hist["primaryLeague"].isin(hist_selected_leagues)
+            hist = hist[hist_team_mask]
     else:
         hist = aggregate_player_year_team(hist_source)
         team_col_for_display = "teamHistoricalName"
@@ -1000,8 +1162,9 @@ with tab_career:
         pos_options_career = sorted([x for x in batting_df[position_source_col].dropna().unique() if str(x).strip() != "" and x not in ["PH", "PR"]])
         pos_filter_career = st.multiselect("Position", pos_options_career, default=pos_options_career, key="career_pos")
     with c5:
-        team_options_career = sorted(set(batting_df["teamName"].dropna().astype(str)).intersection(set(team_id_to_name.values())))
-        team_filter_career = st.multiselect("Franchise", team_options_career, default=team_options_career, key="career_team")
+        actual_team_names_career = sorted(set(batting_df["teamName"].dropna().astype(str)).intersection(set(team_id_to_name.values())))
+        team_options_career = ["All Teams", "American League", "National League"] + actual_team_names_career
+        team_filter_career = st.multiselect("Franchise / League", team_options_career, default=["All Teams"], key="career_team")
 
     show_career_by_team = st.toggle(
         "Show career totals separately by team",
@@ -1018,8 +1181,23 @@ with tab_career:
         # Career Primary Position = most games at a grouped position over the full career.
         # Season Primary Position = most games at a grouped position in that season.
         filtered_career = filtered_career[filtered_career[position_source_col].isin(pos_filter_career)]
-    if team_filter_career:
-        filtered_career = filtered_career[filtered_career["teamName"].isin(team_filter_career)]
+    career_selected_all = (not team_filter_career) or ("All Teams" in team_filter_career)
+    career_selected_franchises = [x for x in team_filter_career if x not in ["All Teams", "American League", "National League"]]
+    career_selected_leagues = []
+    if "American League" in team_filter_career:
+        career_selected_leagues.append("AL")
+    if "National League" in team_filter_career:
+        career_selected_leagues.append("NL")
+
+    # League/franchise filtering changes the DATA included.
+    # The by-team toggle only changes the DISPLAY structure after this filter is applied.
+    if not career_selected_all:
+        career_team_mask = pd.Series(False, index=filtered_career.index)
+        if career_selected_franchises:
+            career_team_mask = career_team_mask | filtered_career["teamName"].isin(career_selected_franchises)
+        if career_selected_leagues and "teamLeague" in filtered_career.columns:
+            career_team_mask = career_team_mask | filtered_career["teamLeague"].isin(career_selected_leagues)
+        filtered_career = filtered_career[career_team_mask]
 
     stat_cols_career = ["R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "HBP", "SF", "G"]
     stat_cols_career = [c for c in stat_cols_career if c in filtered_career.columns]
@@ -1042,7 +1220,7 @@ with tab_career:
             )
             career_totals = career_totals.merge(pos_mode, on=["playerID", "teamName"], how="left")
         career_totals["displayTeam"] = career_totals["teamHistoricalName"]
-        career_mode_note = "By-team mode: each player/team row must pass the stat minimum filters on its own. Position is based on Fielding.csv games."
+        career_mode_note = "By-team mode: each player/team row must pass stat minimum filters on its own. Franchise/league filters first limit the data included; position is based on Fielding.csv games."
     else:
         # Filter first, aggregate by player second, then apply stat minimum filters to the total row.
         career_totals = filtered_career.groupby(["playerID", "fullName", "bats"], as_index=False)[stat_cols_career].sum()
@@ -1052,7 +1230,7 @@ with tab_career:
         else:
             career_totals["displayPosition"] = career_totals.get("primaryPos")
         career_totals["displayTeam"] = career_totals["primaryHistoricalTeamName"]
-        career_mode_note = "Total-career mode: one row per player. Team is the primary team within the filtered data. Position is based on Fielding.csv games."
+        career_mode_note = "Total-career mode: one row per player. Franchise/league filters first limit the data included, then Team becomes the primary team within that filtered data. Position is based on Fielding.csv games."
 
     career_totals = add_rate_stats(career_totals)
     career_totals = apply_stat_min_filters(career_totals, "career")
@@ -1380,7 +1558,7 @@ with tab_ml:
             k_neighbors = st.slider("Similar Players Used", 5, 75, 25, 5, key="ml_k_neighbors")
 
         st.info(
-            "Predictions use machine learning with aging, regression-to-the-mean, and similarity adjustments. "
+            "Predictions use a cached feature-engineered ML pipeline with age, position, bats, team/league context, park factor, playing time, trend slopes, walk/K rates, speed, aging, regression-to-the-mean, and similarity adjustments. "
             "The displayed **Predicted** columns are the adjusted projections recommended for interpretation."
         )
 
@@ -1395,12 +1573,12 @@ with tab_ml:
             )
         else:
             with st.spinner("Training models and generating projections..."):
-                ml_training_df, ml_feature_cols = build_ml_training_set(yearly_df, ml_lookback, ml_min_games, ML_TARGET_STATS)
+                ml_training_df, ml_feature_cols, ml_models, current_rows, base_pred_df = build_base_ml_predictions(
+                    yearly_df, ml_lookback, ml_min_games, max_player_pool=750
+                )
             if ml_training_df.empty or not ml_feature_cols:
                 st.warning("Not enough historical data to train the model with these settings. Lower the minimum games or use a shorter lookback window.")
             else:
-                ml_models = train_random_forest_models(ml_training_df, ml_feature_cols, ML_TARGET_STATS)
-                current_rows = build_current_prediction_rows(yearly_df, ml_lookback, ml_min_games)
 
                 c4, c5, c6 = st.columns(3)
                 c4.metric("Training Examples", f"{len(ml_training_df):,}")
@@ -1419,22 +1597,7 @@ with tab_ml:
                 if current_rows.empty:
                     st.warning("No current players met the minimum playing-time filter for prediction.")
                 else:
-                    X_current = current_rows.reindex(columns=ml_feature_cols).replace([np.inf, -np.inf], np.nan).fillna(0)
-                    base_pred_cols = ["playerID", "fullName", "bats", "last_year", "prediction_year", "age_entering_year", "hist_G_total", "hist_AB_total"]
-                    last_audit_cols = [f"Last {s}" for s in ML_BASE_FEATURE_STATS if f"Last {s}" in current_rows.columns]
-                    pred_df = current_rows[base_pred_cols + last_audit_cols].copy()
-                    for stat, info in ml_models.items():
-                        pred_df[f"Predicted {stat}"] = info["model"].predict(X_current)
-
-                    for stat in ["R", "H", "2B", "3B", "HR", "RBI", "SB", "BB"]:
-                        col = f"Predicted {stat}"
-                        if col in pred_df.columns:
-                            pred_df[col] = pred_df[col].clip(lower=0)
-                    for stat in RATE_STATS:
-                        col = f"Predicted {stat}"
-                        if col in pred_df.columns:
-                            pred_df[col] = pred_df[col].clip(lower=0, upper=1.5)
-
+                    pred_df = base_pred_df.copy()
                     pred_df, age_curve_df, comp_df = apply_advanced_projection_adjustments(
                         pred_df, current_rows, ml_training_df, ml_feature_cols, ML_TARGET_STATS,
                         regression_strength=regression_strength,
@@ -1451,27 +1614,25 @@ with tab_ml:
                     else:
                         st.success(f"Generated {len(pred_df):,} player projections. Scroll down to view the table.")
 
-                    sort_col = f"Final {ml_sort_stat}"
+                    sort_col = f"Predicted {ml_sort_stat}"
                     if sort_col in pred_df.columns:
                         pred_df = pred_df.sort_values(sort_col, ascending=False)
 
                     display_cols = [
                         "fullName", "bats", "last_year", "prediction_year", "age_entering_year", "hist_G_total", "hist_AB_total",
                         "Last G", "Last AB", "Last R", "Last H", "Last 2B", "Last 3B", "Last HR", "Last RBI", "Last SB", "Last BB", "Last BA", "Last OBP", "Last SLG", "Last OPS", "Similar Players",
-                        "Final R", "Final H", "Final 2B", "Final 3B", "Final HR", "Final RBI", "Final SB", "Final BB",
-                        "Final BA", "Final OBP", "Final SLG", "Final OPS"
+                        "Predicted R", "Predicted H", "Predicted 2B", "Predicted 3B", "Predicted HR", "Predicted RBI", "Predicted SB", "Predicted BB",
+                        "Predicted BA", "Predicted OBP", "Predicted SLG", "Predicted OPS"
                     ]
                     display_cols = [c for c in display_cols if c in pred_df.columns]
                     projection_rename = {
                         "fullName": "Player", "bats": "Bats", "last_year": "Last Year", "prediction_year": "Prediction Year",
                         "age_entering_year": "Age", "hist_G_total": "Recent Games", "hist_AB_total": "Recent AB"
                     }
-                    for stat in ML_TARGET_STATS:
-                        projection_rename[f"Final {stat}"] = f"Predicted {stat}"
                     ml_display = clean_ui_columns(pred_df[display_cols].rename(columns=projection_rename))
 
                     st.subheader("Next-Season ML Projections")
-                    st.caption("Last columns are actual stats from each player's true latest CSV season. Predicted columns are the adjusted projection output: Random Forest plus aging, regression-to-the-mean, and similar-player adjustments. Age is prediction-year baseball age as of July 1.")
+                    st.caption("Last columns are actual stats from each player's true latest CSV season. Predicted columns are the final adjusted projection output: Random Forest plus age/age², position, bats, league/team context, park factor, playing time, trend slopes, walk/K rates, aging, regression-to-the-mean, and similar-player adjustments. Age is prediction-year baseball age as of July 1.")
                     for _col in ml_display.columns:
                         if _col.startswith(("Predicted ", "Final ")):
                             _stat = _col.replace("Predicted ", "").replace("Final ", "")
@@ -1511,7 +1672,7 @@ with tab_ml:
 
                     st.info(
                         "How to explain this in an interview: I turned baseball history into a supervised ML projection problem. "
-                        "For each player-season, the input is the previous 3–5 years of production, age, recent averages, and trend slopes. "
+                        "For each player-season, the input is the previous 3–5 years of production plus age/age², position, batting hand, team, league, park factor, playing time, walk/K rates, speed proxies, recent averages, weighted recent production, and trend slopes. "
                         "The target is the next season. I use Random Forest for nonlinear prediction, then improve stability with regression-to-the-mean, "
                         "a learned aging curve, and a similar-player nearest-neighbor blend."
                     )
