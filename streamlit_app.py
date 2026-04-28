@@ -612,44 +612,76 @@ def apply_advanced_projection_adjustments(pred_df, current_rows, ml_training_df,
     return adjusted, age_curve_df, comp_df
 
 def build_current_prediction_rows(yearly_source, lookback_years=3, min_games_per_window=50):
-    """Create one current row per active/recent player using the latest N available years."""
-    df = yearly_source.copy().sort_values(["playerID", "yearID"])
+    """Create one current row per active/recent player using the true latest season for each player.
+
+    Important bug fix:
+    - Do NOT rely on groupby().last(), iloc[-1], or row order after grouping.
+    - For every player, explicitly find latest_year = max(yearID).
+    - Pull Last HR / Last SB / Last 2B / etc. from that exact latest_year row.
+    This prevents cases like Francisco Lindor showing an older HR total when the CSV has a newer season.
+    """
+    df = yearly_source.copy()
     for col in ["yearID", "birthYear", "birthMonth", "birthDay"] + ML_BASE_FEATURE_STATS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    max_year = int(df["yearID"].max())
+    df = df.dropna(subset=["playerID", "yearID"]).copy()
+    df["yearID"] = df["yearID"].astype(int)
+    df = df.sort_values(["playerID", "yearID"]).reset_index(drop=True)
+
+    max_data_year = int(df["yearID"].max())
     rows = []
-    for player_id, g in df.groupby("playerID"):
+
+    for player_id, g in df.groupby("playerID", sort=False):
         g = g.sort_values("yearID").reset_index(drop=True)
-        if len(g) < lookback_years:
+        latest_year = int(g["yearID"].max())
+
+        # Keep active/recent players only. If the dataset goes through 2025, this keeps 2024/2025 players.
+        if latest_year < max_data_year - 1:
             continue
-        history = g.tail(lookback_years)
-        latest = history.iloc[-1]
-        if int(latest["yearID"]) < max_year - 1:
+
+        latest_candidates = g[g["yearID"] == latest_year].copy()
+        if latest_candidates.empty:
             continue
+        latest = latest_candidates.iloc[0]
+
+        # Use the last N available seasons ending with the exact latest year.
+        history = g[g["yearID"] <= latest_year].tail(lookback_years).copy()
+        if len(history) < lookback_years:
+            continue
+
+        # For model reliability, require the last N seasons to be consecutive.
+        expected_years = list(range(latest_year - lookback_years + 1, latest_year + 1))
+        actual_years = history["yearID"].astype(int).tolist()
+        if actual_years != expected_years:
+            continue
+
         if pd.to_numeric(history["G"], errors="coerce").sum() < min_games_per_window:
             continue
+
         birth_year = pd.to_numeric(latest.get("birthYear", np.nan), errors="coerce")
         row = {
             "playerID": player_id,
             "fullName": latest.get("fullName", ""),
             "bats": latest.get("bats", ""),
-            "last_year": int(latest["yearID"]),
-            "prediction_year": int(latest["yearID"]) + 1,
-            "age_entering_year": baseball_age_for_season(int(latest["yearID"]) + 1, birth_year, latest.get("birthMonth", np.nan), latest.get("birthDay", np.nan)),
+            "last_year": latest_year,
+            "prediction_year": latest_year + 1,
+            "age_entering_year": baseball_age_for_season(latest_year + 1, birth_year, latest.get("birthMonth", np.nan), latest.get("birthDay", np.nan)),
             "hist_G_total": pd.to_numeric(history["G"], errors="coerce").sum(),
             "hist_AB_total": pd.to_numeric(history["AB"], errors="coerce").sum(),
-            "Last HR": pd.to_numeric(latest.get("HR", np.nan), errors="coerce"),
-            "Last RBI": pd.to_numeric(latest.get("RBI", np.nan), errors="coerce"),
-            "Last SB": pd.to_numeric(latest.get("SB", np.nan), errors="coerce"),
-            "Last OPS": pd.to_numeric(latest.get("OPS", np.nan), errors="coerce"),
         }
+
+        # Latest-season audit columns shown directly in the ML table.
+        # These are not predictions; they come from the player's exact max(yearID) row in the CSV.
+        for stat in ML_BASE_FEATURE_STATS:
+            row[f"Last {stat}"] = pd.to_numeric(latest.get(stat, np.nan), errors="coerce")
+
         for stat in ML_BASE_FEATURE_STATS:
             values = pd.to_numeric(history[stat], errors="coerce")
             row[f"{stat}_mean_{lookback_years}yr"] = values.mean()
             row[f"{stat}_last"] = values.iloc[-1]
             row[f"{stat}_trend"] = compute_trend_slope(history, stat)
         rows.append(row)
+
     return pd.DataFrame(rows)
 
 def make_ml_prediction_summary(row, sort_stat):
@@ -1341,7 +1373,9 @@ with tab_ml:
                     st.warning("No current players met the minimum playing-time filter for prediction.")
                 else:
                     X_current = current_rows.reindex(columns=ml_feature_cols).replace([np.inf, -np.inf], np.nan).fillna(0)
-                    pred_df = current_rows[["playerID", "fullName", "bats", "last_year", "prediction_year", "age_entering_year", "hist_G_total", "hist_AB_total"]].copy()
+                    base_pred_cols = ["playerID", "fullName", "bats", "last_year", "prediction_year", "age_entering_year", "hist_G_total", "hist_AB_total"]
+                    last_audit_cols = [f"Last {s}" for s in ML_BASE_FEATURE_STATS if f"Last {s}" in current_rows.columns]
+                    pred_df = current_rows[base_pred_cols + last_audit_cols].copy()
                     for stat, info in ml_models.items():
                         pred_df[f"Predicted {stat}"] = info["model"].predict(X_current)
 
@@ -1375,7 +1409,8 @@ with tab_ml:
                         pred_df = pred_df.sort_values(sort_col, ascending=False)
 
                     display_cols = [
-                        "fullName", "bats", "last_year", "prediction_year", "age_entering_year", "hist_G_total", "hist_AB_total", "Last HR", "Last RBI", "Last SB", "Last OPS", "Similar Players",
+                        "fullName", "bats", "last_year", "prediction_year", "age_entering_year", "hist_G_total", "hist_AB_total",
+                        "Last G", "Last AB", "Last R", "Last H", "Last 2B", "Last 3B", "Last HR", "Last RBI", "Last SB", "Last BB", "Last BA", "Last OBP", "Last SLG", "Last OPS", "Similar Players",
                         "Final R", "Final H", "Final 2B", "Final 3B", "Final HR", "Final RBI", "Final SB", "Final BB",
                         "Final BA", "Final OBP", "Final SLG", "Final OPS",
                         "Predicted R", "Predicted H", "Predicted HR", "Predicted RBI", "Predicted SB", "Predicted OPS"
@@ -1387,14 +1422,17 @@ with tab_ml:
                     }))
 
                     st.subheader("Next-Season Advanced ML Projections")
-                    st.caption("Audit check: Last Year and Last HR/RBI/SB/OPS come directly from the latest season available in your CSV files. Age is calculated by baseball season age as of July 1, not simply Prediction Year minus birth year.")
+                    st.caption("Audit check: Last Year and all Last-stat columns come directly from each player's true latest CSV season: max(Year) for that player. Age is prediction-year baseball age as of July 1, not simply Prediction Year minus birth year.")
                     for _col in ml_display.columns:
                         if _col.startswith(("Predicted ", "Final ")):
                             _stat = _col.replace("Predicted ", "").replace("Final ", "")
                             ml_display[_col] = pd.to_numeric(ml_display[_col], errors="coerce").round(3 if _stat in RATE_STATS else 0)
-                    for _col in ["Age", "Recent Games", "Recent AB"]:
+                    for _col in ["Age", "Recent Games", "Recent AB", "Last G", "Last AB", "Last R", "Last H", "Last 2B", "Last 3B", "Last HR", "Last RBI", "Last SB", "Last BB"]:
                         if _col in ml_display.columns:
                             ml_display[_col] = pd.to_numeric(ml_display[_col], errors="coerce").round(0)
+                    for _col in ["Last BA", "Last OBP", "Last SLG", "Last OPS"]:
+                        if _col in ml_display.columns:
+                            ml_display[_col] = pd.to_numeric(ml_display[_col], errors="coerce").round(3)
                     st.dataframe(ml_display, use_container_width=True, hide_index=True)
 
                     if not ml_display.empty:
