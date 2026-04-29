@@ -1707,31 +1707,29 @@ if active_page == "ML Predictions":
                     if sort_col in pred_df.columns:
                         pred_df = pred_df.sort_values(sort_col, ascending=False)
 
+                    # User-facing ML output: show only identifying info and the recommended predicted stats.
+                    # Historical/diagnostic columns such as Last Year, Last HR, Recent AB, Final, raw model outputs,
+                    # and similar-player columns are intentionally hidden from the main table.
                     display_cols = [
-                        "fullName", "bats", "last_year", "prediction_year", "age_entering_year", "hist_G_total", "hist_AB_total",
-                        "Last G", "Last AB", "Last R", "Last H", "Last 2B", "Last 3B", "Last HR", "Last RBI", "Last SB", "Last BB", "Last BA", "Last OBP", "Last SLG", "Last OPS",
+                        "fullName", "bats", "prediction_year", "age_entering_year",
                         "Predicted R", "Predicted H", "Predicted 2B", "Predicted 3B", "Predicted HR", "Predicted RBI", "Predicted SB", "Predicted BB",
                         "Predicted BA", "Predicted OBP", "Predicted SLG", "Predicted OPS"
                     ]
                     display_cols = [c for c in display_cols if c in pred_df.columns]
                     projection_rename = {
-                        "fullName": "Player", "bats": "Bats", "last_year": "Last Year", "prediction_year": "Prediction Year",
-                        "age_entering_year": "Age", "hist_G_total": "Recent Games", "hist_AB_total": "Recent AB"
+                        "fullName": "Player", "bats": "Bats", "prediction_year": "Prediction Year",
+                        "age_entering_year": "Age"
                     }
                     ml_display = clean_ui_columns(pred_df[display_cols].rename(columns=projection_rename))
 
                     st.subheader("Next-Season ML Projections")
-                    st.caption("Last columns are actual stats from each player's true latest CSV season. Predicted columns are the recommended next-season projection: Random Forest plus age/age², position, bats, league/team context, park factor, playing time, trend slopes, walk/K rates, aging, regression-to-the-mean, and similarity adjustments. Age is prediction-year baseball age as of July 1.")
+                    st.caption("Predictions use machine learning with aging, regression-to-the-mean, and similarity adjustments. The table shows the recommended projected stats only.")
                     for _col in ml_display.columns:
                         if _col.startswith("Predicted "):
                             _stat = _col.replace("Predicted ", "")
                             ml_display[_col] = pd.to_numeric(ml_display[_col], errors="coerce").round(3 if _stat in RATE_STATS else 0)
-                    for _col in ["Age", "Recent Games", "Recent AB", "Last G", "Last AB", "Last R", "Last H", "Last 2B", "Last 3B", "Last HR", "Last RBI", "Last SB", "Last BB"]:
-                        if _col in ml_display.columns:
-                            ml_display[_col] = pd.to_numeric(ml_display[_col], errors="coerce").round(0)
-                    for _col in ["Last BA", "Last OBP", "Last SLG", "Last OPS"]:
-                        if _col in ml_display.columns:
-                            ml_display[_col] = pd.to_numeric(ml_display[_col], errors="coerce").round(3)
+                    if "Age" in ml_display.columns:
+                        ml_display["Age"] = pd.to_numeric(ml_display["Age"], errors="coerce").round(0)
                     render_output_table(ml_display, key="ml_predictions", file_name="ml_predictions.csv")
 
                     if not ml_display.empty:
