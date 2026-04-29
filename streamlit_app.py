@@ -118,6 +118,20 @@ def team_league(team_id, year=None):
         return "NL"
     return "Unknown"
 
+def historical_team_name(team_id_original, year=None):
+    """Display the real historical team name for the season while preserving franchise filtering.
+
+    Cleveland is one franchise for filtering, but it should display as Indians through 2021
+    and Guardians starting in 2022. Other historical franchise names use Lahman team IDs
+    where available, such as BRO, FLO, MON, SLA, etc.
+    """
+    original = str(team_id_original)
+    tid = normalize_team_id(original)
+    yr = safe_int_year(year)
+    if tid == "CLE" and yr is not None:
+        return "Cleveland Indians" if yr <= 2021 else "Cleveland Guardians"
+    return team_id_to_historical_name.get(original, team_id_to_historical_name.get(tid, original))
+
 COUNT_STATS = ["R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "G"]
 RATE_STATS = ["BA", "OBP", "SLG", "OPS"]
 TREND_COUNT_COLS = ["R Δ", "H Δ", "2B Δ", "3B Δ", "HR Δ", "RBI Δ", "SB Δ", "BB Δ"]
@@ -345,6 +359,32 @@ def format_display_table(df, count_cols=None, rate_cols=None, score_cols=None):
     return df
 
 
+
+
+
+MAX_TABLE_DISPLAY_ROWS = 1000
+
+@st.cache_data(show_spinner=False)
+def _df_to_csv_bytes(df):
+    return df.to_csv(index=False).encode("utf-8")
+
+def render_output_table(df, *, key, file_name, display_rows=MAX_TABLE_DISPLAY_ROWS):
+    """Render a table quickly and add a CSV export button that opens cleanly in Excel."""
+    table_df = df.copy()
+    if len(table_df) > display_rows:
+        st.caption(f"Showing first {display_rows:,} rows for speed. Export downloads all {len(table_df):,} rows.")
+        display_df = table_df.head(display_rows)
+    else:
+        display_df = table_df
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Export CSV for Excel",
+        data=_df_to_csv_bytes(table_df),
+        file_name=file_name,
+        mime="text/csv",
+        key=f"download_{key}",
+        use_container_width=False,
+    )
 
 def clean_feature_name(feature):
     """Make model feature names readable for the UI."""
@@ -787,12 +827,27 @@ def build_similar_player_predictions(current_rows, ml_training_df, feature_cols_
         candidate_idx = np.where(candidate_mask)[0]
         if len(candidate_idx) == 0:
             continue
-        nearest = candidate_idx[np.argsort(distances[candidate_idx])[:k_neighbors]]
-        comps = ml_training_df.iloc[nearest]
+        # Pick nearest UNIQUE comparable players. The training set can contain multiple
+        # seasons for the same historical player, so a simple top-k can repeat names.
+        # Keep only the closest season for each comparable player.
+        sorted_candidates = candidate_idx[np.argsort(distances[candidate_idx])]
+        unique_nearest = []
+        seen_comp_players = set()
+        target_pid = str(row.get("playerID")) if pd.notna(row.get("playerID")) else ""
+        for idx in sorted_candidates:
+            comp_pid = str(train_player_ids[idx]) if idx < len(train_player_ids) else ""
+            if not comp_pid or comp_pid == target_pid or comp_pid in seen_comp_players:
+                continue
+            unique_nearest.append(idx)
+            seen_comp_players.add(comp_pid)
+            if len(unique_nearest) >= k_neighbors:
+                break
+        if not unique_nearest:
+            continue
+        comps = ml_training_df.iloc[unique_nearest]
         out = {
             "playerID": row.get("playerID"),
             "Similar Player Sample": len(comps),
-            "Similar Players": ", ".join(comps["fullName"].dropna().astype(str).head(5).tolist()),
         }
         for stat in target_stats:
             tcol = f"target_{stat}"
@@ -815,7 +870,6 @@ def apply_advanced_projection_adjustments(pred_df, current_rows, ml_training_df,
         adjusted = adjusted.merge(comp_df, on="playerID", how="left")
     else:
         adjusted["Similar Player Sample"] = np.nan
-        adjusted["Similar Players"] = ""
     for stat in target_stats:
         rf_col = f"Raw ML {stat}"
         final_col = f"Predicted {stat}"
@@ -939,8 +993,8 @@ def load_data():
 
     batting["teamID_original"] = batting["teamID"]
     fielding["teamID_original"] = fielding["teamID"]
-    batting["teamHistoricalName"] = batting["teamID_original"].map(team_id_to_historical_name).fillna(batting["teamID_original"])
-    fielding["teamHistoricalName"] = fielding["teamID_original"].map(team_id_to_historical_name).fillna(fielding["teamID_original"])
+    batting["teamHistoricalName"] = batting.apply(lambda r: historical_team_name(r["teamID_original"], r.get("yearID", None)), axis=1)
+    fielding["teamHistoricalName"] = fielding.apply(lambda r: historical_team_name(r["teamID_original"], r.get("yearID", None)), axis=1)
 
     batting["teamID"] = batting["teamID"].replace(team_id_mapping)
     fielding["teamID"] = fielding["teamID"].replace(team_id_mapping)
@@ -1039,11 +1093,11 @@ year_max = int(max(all_years))
 default_start_hist = max(year_min, 2010)
 default_start_leaders = max(year_min, 2020)
 
-tab_hist, tab_career, tab_leaders, tab_compare, tab_trend, tab_value, tab_ml = st.tabs([
-    "Historical Explorer", "Career Totals", "Leaderboards", "Comparison Tool", "Trend Value", "Valuation", "ML Predictions"
-])
+PAGE_OPTIONS = ["Historical Explorer", "Career Totals", "Leaderboards", "Comparison Tool", "Trend Value", "Valuation", "ML Predictions"]
+active_page = st.sidebar.radio("Choose Page", PAGE_OPTIONS, index=0)
+st.sidebar.caption("Speed note: using page navigation instead of tabs prevents Streamlit from recalculating every page after each filter change.")
 
-with tab_hist:
+if active_page == "Historical Explorer":
     render_section_header(
         "🔎 Historical Explorer",
         "Find individual player seasons. Split-team seasons can stay as separate team rows or be combined into one primary-team season row."
@@ -1167,12 +1221,10 @@ with tab_hist:
         team_col_for_display: "Team"
     })
     st.divider()
-    st.dataframe(
-        format_display_table(clean_ui_columns(hist_display), count_cols=["Year", "R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB"], rate_cols=["BA", "OBP", "SLG", "OPS"]),
-        use_container_width=True, hide_index=True
-    )
+    hist_table = format_display_table(clean_ui_columns(hist_display), count_cols=["Year", "R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB"], rate_cols=["BA", "OBP", "SLG", "OPS"])
+    render_output_table(hist_table, key="historical_explorer", file_name="historical_explorer.csv")
 
-with tab_career:
+if active_page == "Career Totals":
     render_section_header(
         "📚 Career Totals",
         "Aggregate career production with an independent display toggle: one primary-team career row or separate totals by each team."
@@ -1292,12 +1344,10 @@ with tab_career:
         "fullName": "Player", "bats": "Bats", "displayPosition": "Primary Position", "displayTeam": "Team"
     })
     st.divider()
-    st.dataframe(
-        format_display_table(clean_ui_columns(career_display), count_cols=["R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB"], rate_cols=["BA", "OBP", "SLG", "OPS"]),
-        use_container_width=True, hide_index=True
-    )
+    career_table = format_display_table(clean_ui_columns(career_display), count_cols=["R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB"], rate_cols=["BA", "OBP", "SLG", "OPS"])
+    render_output_table(career_table, key="career_totals", file_name="career_totals.csv")
 
-with tab_leaders:
+if active_page == "Leaderboards":
     render_section_header("🏆 Leaderboards", "Build custom offensive rankings with weighted stats, filters, summary cards, and charts.")
     c1, c2 = st.columns(2)
     with c1:
@@ -1337,12 +1387,10 @@ with tab_leaders:
     ]].sort_values(sort_stat_leaders, ascending=False).head(top_n_leaders).rename(columns={"fullName": "Player", "bats": "Bats", "score": "Score"})
 
     st.divider()
-    st.dataframe(
-        format_display_table(clean_ui_columns(leaderboard_display), count_cols=["R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB"], rate_cols=["BA", "OBP", "SLG", "OPS"], score_cols=["Score"]),
-        use_container_width=True, hide_index=True
-    )
+    leaderboard_table = format_display_table(clean_ui_columns(leaderboard_display), count_cols=["R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB"], rate_cols=["BA", "OBP", "SLG", "OPS"], score_cols=["Score"])
+    render_output_table(leaderboard_table, key="leaderboards", file_name="leaderboards.csv")
 
-with tab_compare:
+if active_page == "Comparison Tool":
     render_section_header("📈 Comparison Tool", "Compare up to three players across years with tables and trend charts.")
     label_map_compare = build_player_label_map(yearly_df)
     selected_labels_compare = st.multiselect("Select up to 3 players", options=list(label_map_compare.keys()), max_selections=3, key="compare_players")
@@ -1355,14 +1403,16 @@ with tab_compare:
 
         st.subheader("Year-by-Year Comparison")
         compare_display = compare[["yearID", "fullName", "R", "H", "2B", "3B", "HR", "RBI", "SB", "AB", "BA", "OBP", "SLG", "OPS"]].sort_values(["fullName", "yearID"]).rename(columns={"yearID": "Year", "fullName": "Player"})
-        st.dataframe(format_display_table(clean_ui_columns(compare_display), count_cols=["Year", "R", "H", "2B", "3B", "HR", "RBI", "SB", "AB"], rate_cols=["BA", "OBP", "SLG", "OPS"]), use_container_width=True, hide_index=True)
+        compare_table = format_display_table(clean_ui_columns(compare_display), count_cols=["Year", "R", "H", "2B", "3B", "HR", "RBI", "SB", "AB"], rate_cols=["BA", "OBP", "SLG", "OPS"])
+        render_output_table(compare_table, key="comparison_yearly", file_name="comparison_year_by_year.csv")
 
         st.subheader("Career Totals")
         career_compare = compare.groupby(["fullName"], as_index=False)[["R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "HBP", "SF"]].sum()
         career_compare = add_rate_stats(career_compare)
         career_compare = safe_round_rate_stats(career_compare)
         career_compare_display = career_compare[["fullName", "R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BA", "OBP", "SLG", "OPS"]].sort_values("HR", ascending=False).rename(columns={"fullName": "Player"})
-        st.dataframe(format_display_table(clean_ui_columns(career_compare_display), count_cols=["R", "AB", "H", "2B", "3B", "HR", "RBI", "SB"], rate_cols=["BA", "OBP", "SLG", "OPS"]), use_container_width=True, hide_index=True)
+        career_compare_table = format_display_table(clean_ui_columns(career_compare_display), count_cols=["R", "AB", "H", "2B", "3B", "HR", "RBI", "SB"], rate_cols=["BA", "OBP", "SLG", "OPS"])
+        render_output_table(career_compare_table, key="comparison_career", file_name="comparison_career_totals.csv")
 
         st.subheader(f"{stat_choice_compare} Trends")
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -1380,7 +1430,7 @@ with tab_compare:
         ax.grid(True, alpha=0.3)
         st.pyplot(fig)
 
-with tab_trend:
+if active_page == "Trend Value":
     render_section_header("🔥 Trend Value", "Shows only trend numbers: which stats are rising or declining per year over the selected recent window.")
     c1, c2 = st.columns(2)
     with c1:
@@ -1437,7 +1487,7 @@ with tab_trend:
         count_cols=[c for c in TREND_COUNT_COLS if c in trend_sorted.columns],
         rate_cols=[c for c in TREND_RATE_COLS if c in trend_sorted.columns],
     )
-    st.dataframe(trend_sorted_display, use_container_width=True, hide_index=True)
+    render_output_table(trend_sorted_display, key="trend_table", file_name="trend_value.csv")
     breakout_df = trend_value_df[["fullName", "bats", "OPS_trend", "HR_trend", "XBH_noHR_trend", "RBI_trend", "SB_trend"]].copy()
     top_breakouts = breakout_df.sort_values("OPS_trend", ascending=False).head(10)
     biggest_declines = breakout_df.sort_values("OPS_trend", ascending=True).head(10)
@@ -1449,10 +1499,12 @@ with tab_trend:
     c3, c4 = st.columns(2)
     with c3:
         st.subheader("🔥 Top Breakout Players")
-        st.dataframe(format_display_table(top_breakouts_display, count_cols=["HR Δ", "2B+3B Δ", "RBI Δ", "SB Δ"], rate_cols=["OPS Δ"]), use_container_width=True, hide_index=True)
+        breakout_table = format_display_table(top_breakouts_display, count_cols=["HR Δ", "2B+3B Δ", "RBI Δ", "SB Δ"], rate_cols=["OPS Δ"])
+        render_output_table(breakout_table, key="top_breakouts", file_name="top_breakouts.csv")
     with c4:
         st.subheader("❄️ Biggest Declines")
-        st.dataframe(format_display_table(biggest_declines_display, count_cols=["HR Δ", "2B+3B Δ", "RBI Δ", "SB Δ"], rate_cols=["OPS Δ"]), use_container_width=True, hide_index=True)
+        declines_table = format_display_table(biggest_declines_display, count_cols=["HR Δ", "2B+3B Δ", "RBI Δ", "SB Δ"], rate_cols=["OPS Δ"])
+        render_output_table(declines_table, key="biggest_declines", file_name="biggest_declines.csv")
 
     st.subheader("Insight Summaries")
     top_breakout_row = trend_value_df.sort_values("OPS_trend", ascending=False).head(1)
@@ -1483,7 +1535,7 @@ with tab_trend:
     if not player_summary_row.empty:
         st.info(make_trend_insight_summary(player_summary_row.iloc[0]))
 
-with tab_value:
+if active_page == "Valuation":
     render_section_header("💰 Valuation", "Blend recent production and trend momentum into a valuation score.")
     c1, c2 = st.columns(2)
     with c1:
@@ -1554,10 +1606,8 @@ with tab_value:
     valuation_display = valuation_df[["fullName", "bats", "R", "H", "2B", "3B", "HR", "RBI", "SB", "BA", "OBP", "SLG", "OPS", "Trend_Score", "Perf_Score", "Valuation_Score"]].sort_values("Valuation_Score", ascending=False).rename(columns={
         "fullName": "Player", "bats": "Bats", "Trend_Score": "Trend Score", "Perf_Score": "Performance Score", "Valuation_Score": "Valuation Score"
     })
-    st.dataframe(
-        format_display_table(clean_ui_columns(valuation_display), count_cols=["R", "H", "2B", "3B", "HR", "RBI", "SB"], rate_cols=["BA", "OBP", "SLG", "OPS"], score_cols=["Trend Score", "Performance Score", "Valuation Score"]),
-        use_container_width=True, hide_index=True
-    )
+    valuation_table = format_display_table(clean_ui_columns(valuation_display), count_cols=["R", "H", "2B", "3B", "HR", "RBI", "SB"], rate_cols=["BA", "OBP", "SLG", "OPS"], score_cols=["Trend Score", "Performance Score", "Valuation Score"])
+    render_output_table(valuation_table, key="valuation", file_name="valuation.csv")
 
     st.subheader("Valuation Insight Summaries")
     best_value_row = valuation_df.sort_values("Valuation_Score", ascending=False).head(1)
@@ -1567,7 +1617,7 @@ with tab_value:
     if not worst_value_row.empty:
         st.warning(f"⚠️ Weakest valuation profile: {make_valuation_summary(worst_value_row.iloc[0])}")
 
-with tab_ml:
+if active_page == "ML Predictions":
     render_section_header(
         "🤖 ML Predictions",
         "Generate next-season projections using machine learning, aging curves, regression-to-the-mean, and similar-player comparisons."
@@ -1607,7 +1657,7 @@ with tab_ml:
         if not st.session_state.get("ml_predictions_have_run", False):
             st.info(
                 "Choose the lookback window and projection settings above, then click **Generate / Refresh ML Predictions**. "
-                "After it runs, scroll down to see the projection table, top prediction summary, similar players, and feature importance."
+                "After it runs, scroll down to see the projection table, top prediction summary, and feature importance."
             )
         else:
             with st.spinner("Training models and generating projections..."):
@@ -1630,7 +1680,8 @@ with tab_ml:
                 if not metrics_df.empty:
                     st.subheader("Model Accuracy Check")
                     st.caption("MAE means average miss. For example, HR MAE of 4 means the model is typically off by about 4 home runs on the test seasons.")
-                    st.dataframe(clean_ui_columns(metrics_df.round({"MAE": 3, "R²": 3})), use_container_width=True, hide_index=True)
+                    metrics_table = clean_ui_columns(metrics_df.round({"MAE": 3, "R²": 3}))
+                    render_output_table(metrics_table, key="ml_accuracy", file_name="ml_model_accuracy.csv")
 
                 if current_rows.empty:
                     st.warning("No current players met the minimum playing-time filter for prediction.")
@@ -1658,7 +1709,7 @@ with tab_ml:
 
                     display_cols = [
                         "fullName", "bats", "last_year", "prediction_year", "age_entering_year", "hist_G_total", "hist_AB_total",
-                        "Last G", "Last AB", "Last R", "Last H", "Last 2B", "Last 3B", "Last HR", "Last RBI", "Last SB", "Last BB", "Last BA", "Last OBP", "Last SLG", "Last OPS", "Similar Players",
+                        "Last G", "Last AB", "Last R", "Last H", "Last 2B", "Last 3B", "Last HR", "Last RBI", "Last SB", "Last BB", "Last BA", "Last OBP", "Last SLG", "Last OPS",
                         "Predicted R", "Predicted H", "Predicted 2B", "Predicted 3B", "Predicted HR", "Predicted RBI", "Predicted SB", "Predicted BB",
                         "Predicted BA", "Predicted OBP", "Predicted SLG", "Predicted OPS"
                     ]
@@ -1670,10 +1721,10 @@ with tab_ml:
                     ml_display = clean_ui_columns(pred_df[display_cols].rename(columns=projection_rename))
 
                     st.subheader("Next-Season ML Projections")
-                    st.caption("Last columns are actual stats from each player's true latest CSV season. Predicted columns are the final adjusted projection output: Random Forest plus age/age², position, bats, league/team context, park factor, playing time, trend slopes, walk/K rates, aging, regression-to-the-mean, and similar-player adjustments. Age is prediction-year baseball age as of July 1.")
+                    st.caption("Last columns are actual stats from each player's true latest CSV season. Predicted columns are the recommended next-season projection: Random Forest plus age/age², position, bats, league/team context, park factor, playing time, trend slopes, walk/K rates, aging, regression-to-the-mean, and similarity adjustments. Age is prediction-year baseball age as of July 1.")
                     for _col in ml_display.columns:
-                        if _col.startswith(("Predicted ", "Final ")):
-                            _stat = _col.replace("Predicted ", "").replace("Final ", "")
+                        if _col.startswith("Predicted "):
+                            _stat = _col.replace("Predicted ", "")
                             ml_display[_col] = pd.to_numeric(ml_display[_col], errors="coerce").round(3 if _stat in RATE_STATS else 0)
                     for _col in ["Age", "Recent Games", "Recent AB", "Last G", "Last AB", "Last R", "Last H", "Last 2B", "Last 3B", "Last HR", "Last RBI", "Last SB", "Last BB"]:
                         if _col in ml_display.columns:
@@ -1681,23 +1732,21 @@ with tab_ml:
                     for _col in ["Last BA", "Last OBP", "Last SLG", "Last OPS"]:
                         if _col in ml_display.columns:
                             ml_display[_col] = pd.to_numeric(ml_display[_col], errors="coerce").round(3)
-                    st.dataframe(ml_display, use_container_width=True, hide_index=True)
+                    render_output_table(ml_display, key="ml_predictions", file_name="ml_predictions.csv")
 
                     if not ml_display.empty:
                         st.subheader("Top Prediction Summary")
                         st.success(make_ml_prediction_summary(ml_display.iloc[0], ml_sort_stat))
 
-                    with st.expander("Show age curve and similar-player details"):
-                        st.write("The age curve estimates how players historically changed from their most recent season to the following season at each age. Similar-player comps compare each player's recent profile to other historical players with similar age and statistics; the target player is excluded from his own comp list.")
+                    with st.expander("Show age curve details"):
+                        st.write("The age curve estimates how players historically changed from their most recent season to the following season at each age. Similar-player comps are still used internally for the projection adjustment, but they are hidden from the main output to keep the page clean.")
                         if not age_curve_df.empty:
                             age_stats = [s for s in ML_TARGET_STATS if s in age_curve_df["Stat"].unique()]
                             if age_stats:
                                 age_view_stat = st.selectbox("Age Curve Stat", age_stats, index=0, key="ml_age_curve_stat")
                                 age_view = age_curve_df[age_curve_df["Stat"] == age_view_stat].rename(columns={"Age Adjustment": "Expected Age Change"})
-                                st.dataframe(format_display_table(age_view, rate_cols=["Expected Age Change"]), use_container_width=True, hide_index=True)
-                        if "Similar Players" in pred_df.columns:
-                            comps_display = pred_df[["fullName", "age_entering_year", "Similar Player Sample", "Similar Players"]].rename(columns={"fullName": "Player", "age_entering_year": "Age"}).head(25)
-                            st.dataframe(clean_ui_columns(comps_display), use_container_width=True, hide_index=True)
+                                age_curve_table = format_display_table(age_view, rate_cols=["Expected Age Change"])
+                                render_output_table(age_curve_table, key="ml_age_curve", file_name="ml_age_curve.csv")
 
                     st.subheader("What Stats Matter Most?")
                     importance_options = [s for s in ML_TARGET_STATS if s in ml_models]
@@ -1705,7 +1754,8 @@ with tab_ml:
                         importance_stat = st.selectbox("Feature Importance For", importance_options, index=0, key="ml_importance_stat")
                         importance_df = ml_models[importance_stat]["importance"].head(15).copy()
                         importance_df["Feature"] = importance_df["Feature"].apply(clean_feature_name)
-                        st.dataframe(format_display_table(clean_ui_columns(importance_df), rate_cols=["Importance"]), use_container_width=True, hide_index=True)
+                        importance_table = format_display_table(clean_ui_columns(importance_df), rate_cols=["Importance"])
+                        render_output_table(importance_table, key="ml_feature_importance", file_name="ml_feature_importance.csv")
                         top_bar_chart(importance_df, "Feature", "Importance", f"Top Feature Importance for Predicting {importance_stat}", top_n=15)
 
                     st.info(
