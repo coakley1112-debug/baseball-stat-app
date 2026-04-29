@@ -1030,6 +1030,15 @@ with tab_hist:
         "🔎 Historical Explorer",
         "Find individual player seasons. Split-team seasons can stay as separate team rows or be combined into one primary-team season row."
     )
+    hist_position_filter_mode = st.selectbox(
+        "Position Filter Mode",
+        ["Season Primary Position", "Career Primary Position"],
+        index=0,
+        key="hist_position_filter_mode",
+        help="Season mode filters by the player’s primary position for that season. Career mode filters by the player’s full-career primary position from Fielding.csv games."
+    )
+    hist_position_source_col = "careerPrimaryPos" if hist_position_filter_mode == "Career Primary Position" else "primaryPos"
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         hist_year_range = st.slider("Year Range", year_min, year_max, (default_start_hist, year_max), key="hist_year")
@@ -1037,7 +1046,7 @@ with tab_hist:
         bats_options = sorted([x for x in batting_df["bats"].dropna().unique() if str(x).strip() != ""])
         hist_bats = st.multiselect("Batting Hand", bats_options, default=bats_options, key="hist_bats")
     with c3:
-        pos_options = sorted([x for x in batting_df["primaryPos"].dropna().unique() if str(x).strip() != "" and x not in ["PH", "PR"]])
+        pos_options = sorted([x for x in batting_df[hist_position_source_col].dropna().unique() if str(x).strip() != "" and x not in ["PH", "PR"]])
         hist_pos = st.multiselect("Primary Position", pos_options, default=pos_options, key="hist_pos")
     with c4:
         actual_team_names = sorted(set(batting_df["teamName"].dropna().astype(str)).intersection(set(team_id_to_name.values())))
@@ -1055,7 +1064,7 @@ with tab_hist:
     if hist_bats:
         hist_source = hist_source[hist_source["bats"].isin(hist_bats)]
     if hist_pos:
-        hist_source = hist_source[hist_source["primaryPos"].isin(hist_pos)]
+        hist_source = hist_source[hist_source[hist_position_source_col].isin(hist_pos)]
 
     hist_selected_all = (not hist_teams) or ("All Teams" in hist_teams)
     hist_selected_franchises = [x for x in hist_teams if x not in ["All Teams", "American League", "National League"]]
@@ -1092,13 +1101,20 @@ with tab_hist:
         team_sort_col = "teamName"
         hist_note = "Split mode: one row per player-season-team. Split seasons stay separate."
 
+    if hist_position_source_col in hist.columns:
+        hist["displayPosition"] = hist[hist_position_source_col]
+    elif "primaryPos" in hist.columns:
+        hist["displayPosition"] = hist["primaryPos"]
+    else:
+        hist["displayPosition"] = ""
+
     hist = apply_stat_min_filters(hist, "hist")
     hist = safe_round_rate_stats(hist)
     st.caption(hist_note)
 
     c5, c6 = st.columns(2)
     sort_options_hist = [
-        "yearID", "fullName", team_sort_col, team_col_for_display, "primaryPos",
+        "yearID", "fullName", team_sort_col, team_col_for_display, "displayPosition",
         "R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "BA", "OBP", "SLG", "OPS"
     ]
     with c5:
@@ -1112,7 +1128,7 @@ with tab_hist:
         hist_sort_order = st.selectbox("Sort Order", ["Descending", "Ascending"], index=0, key="hist_sort_order")
 
     display_cols_hist = [
-        "yearID", "fullName", "bats", "primaryPos", team_col_for_display,
+        "yearID", "fullName", "bats", "displayPosition", team_col_for_display,
         "R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "BA", "OBP", "SLG", "OPS"
     ]
     display_cols_hist = [c for c in display_cols_hist if c in hist.columns]
@@ -1129,7 +1145,7 @@ with tab_hist:
     c9.metric("Year Range", f"{hist_year_range[0]}-{hist_year_range[1]}")
 
     hist_display = hist_display_raw.rename(columns={
-        "yearID": "Year", "fullName": "Player", "bats": "Bats", "primaryPos": "Primary Position",
+        "yearID": "Year", "fullName": "Player", "bats": "Bats", "displayPosition": "Primary Position",
         team_col_for_display: "Team"
     })
     st.divider()
