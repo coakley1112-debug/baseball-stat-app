@@ -1201,8 +1201,9 @@ if active_page == "Historical Explorer":
     st.caption(hist_note)
 
     c5, c6 = st.columns(2)
+    # Keep Historical Explorer sorting focused on baseball statistics only.
+    # Do not expose backend/name/team/position fields in the sort dropdown.
     sort_options_hist = [
-        "yearID", "fullName", team_sort_col, team_col_for_display, "displayPosition",
         "R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "BA", "OBP", "SLG", "OPS"
     ]
     with c5:
