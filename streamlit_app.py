@@ -645,9 +645,9 @@ def train_random_forest_models(ml_training_df, feature_cols_tuple, target_stats_
         else:
             X_train, X_test, y_train, y_test = X_valid, X_valid, y_valid, y_valid
         model = RandomForestRegressor(
-            n_estimators=50,
-            max_depth=10,
-            min_samples_leaf=8,
+            n_estimators=20,
+            max_depth=8,
+            min_samples_leaf=10,
             max_features="sqrt",
             random_state=random_state,
             n_jobs=-1,
@@ -665,7 +665,7 @@ def train_random_forest_models(ml_training_df, feature_cols_tuple, target_stats_
 
 
 @st.cache_data(show_spinner=False)
-def build_current_prediction_rows(yearly_source, lookback_years=3, min_games_per_window=50, max_player_pool=750):
+def build_current_prediction_rows(yearly_source, lookback_years=3, min_games_per_window=50, max_player_pool=300):
     """Create one current row per active/recent player using each player's true max(yearID).
 
     Optimized for Streamlit Cloud:
@@ -781,7 +781,7 @@ def lookup_age_adjustment(age_curve_df, stat, age):
 
 
 @st.cache_data(show_spinner=False)
-def build_base_ml_predictions(yearly_source, lookback_years, min_games_per_window, max_player_pool=750):
+def build_base_ml_predictions(yearly_source, lookback_years, min_games_per_window, max_player_pool=300):
     """Train once, predict once, and return reusable base objects for fast UI filtering."""
     target_stats_tuple = tuple(ML_TARGET_STATS)
     ml_training_df, feature_cols = build_ml_training_set(yearly_source, lookback_years, min_games_per_window, target_stats_tuple)
@@ -881,7 +881,10 @@ def apply_advanced_projection_adjustments(pred_df, current_rows, ml_training_df,
     adjusted = pred_df.copy()
     baselines = get_target_baselines(ml_training_df, target_stats)
     age_curve_df = get_age_curve_adjustments(ml_training_df, tuple(target_stats))
-    comp_df = build_similar_player_predictions(current_rows, ml_training_df, tuple(feature_cols), tuple(target_stats), k_neighbors=k_neighbors)
+    if comp_weight and comp_weight > 0:
+        comp_df = build_similar_player_predictions(current_rows, ml_training_df, tuple(feature_cols), tuple(target_stats), k_neighbors=k_neighbors)
+    else:
+        comp_df = pd.DataFrame()
     if not comp_df.empty:
         adjusted = adjusted.merge(comp_df, on="playerID", how="left")
     else:
@@ -1643,13 +1646,15 @@ if active_page == "ML Predictions":
     if not SKLEARN_AVAILABLE:
         st.error("Scikit-learn is not installed. In Command Prompt, run: pip install scikit-learn")
     else:
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4top = st.columns(4)
         with c1:
             ml_lookback = st.selectbox("Lookback Window", [3, 4, 5], index=0, key="ml_lookback")
         with c2:
             ml_min_games = st.number_input("Minimum Games in Lookback Window", 0, 800, 150, key="ml_min_games")
         with c3:
             ml_sort_stat = st.selectbox("Rank Predictions By", ["OPS", "HR", "RBI", "SB", "R", "H", "BA", "OBP", "SLG", "BB"], index=0, key="ml_sort_stat")
+        with c4top:
+            ml_max_players = st.selectbox("Projection Scope", [150, 300, 500, 750], index=1, key="ml_max_players", help="Lower numbers are much faster on Streamlit Cloud.")
 
         st.subheader("Advanced Projection Settings")
         a1, a2, a3, a4 = st.columns(4)
@@ -1658,9 +1663,9 @@ if active_page == "ML Predictions":
         with a2:
             age_strength = st.slider("Aging Curve Strength", 0.00, 1.00, 0.50, 0.05, key="ml_age_strength")
         with a3:
-            comp_weight = st.slider("Similar Player Weight", 0.00, 0.60, 0.25, 0.05, key="ml_comp_weight")
+            comp_weight = st.slider("Similar Player Weight", 0.00, 0.60, 0.10, 0.05, key="ml_comp_weight")
         with a4:
-            k_neighbors = st.slider("Similar Players Used", 5, 75, 25, 5, key="ml_k_neighbors")
+            k_neighbors = st.slider("Similar Players Used", 5, 50, 10, 5, key="ml_k_neighbors")
 
         st.info(
             "Predictions use a cached feature-engineered ML pipeline with age, position, bats, team/league context, park factor, playing time, trend slopes, walk/K rates, speed, aging, regression-to-the-mean, and similarity adjustments. "
@@ -1677,9 +1682,9 @@ if active_page == "ML Predictions":
                 "After it runs, scroll down to see the projection table, top prediction summary, and feature importance."
             )
         else:
-            with st.spinner("Training models and generating projections..."):
+            with st.spinner("Generating cached fast projections..."):
                 ml_training_df, ml_feature_cols, ml_models, current_rows, base_pred_df = build_base_ml_predictions(
-                    yearly_df, ml_lookback, ml_min_games, max_player_pool=750
+                    yearly_df, ml_lookback, ml_min_games, max_player_pool=ml_max_players
                 )
             if ml_training_df.empty or not ml_feature_cols:
                 st.warning("Not enough historical data to train the model with these settings. Lower the minimum games or use a shorter lookback window.")
