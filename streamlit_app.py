@@ -81,8 +81,8 @@ team_id_to_historical_name = {
 }
 
 
-# Lightweight team/league context features for ML. These are modern-franchise approximations
-# designed to add context without requiring extra external park-factor files.
+# Lightweight team/league context features for ML and filters. Historical exceptions are handled by year:
+# Houston was NL through 2012 and AL starting 2013; Milwaukee/Seattle was AL through 1997 and NL starting 1998.
 AL_TEAMS = {"BAL", "BOS", "NYY", "TBR", "TOR", "CWS", "CLE", "DET", "KCR", "MIN", "HOU", "LAA", "OAK", "SEA", "TEX"}
 NL_TEAMS = {"ATL", "MIA", "NYM", "PHI", "WAS", "CHC", "CIN", "MIL", "PIT", "STL", "ARI", "COL", "LAD", "SDP", "SFG"}
 TEAM_PARK_FACTOR = {
@@ -93,10 +93,28 @@ TEAM_PARK_FACTOR = {
     "KCR": 0.99, "MIN": 0.99, "CWS": 1.00, "TBR": 1.00, "WAS": 1.00, "LAA": 1.00
 }
 
-def team_league(team_id):
-    if team_id in AL_TEAMS:
+def normalize_team_id(team_id):
+    return team_id_mapping.get(str(team_id), str(team_id))
+
+def safe_int_year(year):
+    try:
+        if pd.isna(year):
+            return None
+        return int(year)
+    except Exception:
+        return None
+
+def team_league(team_id, year=None):
+    """Return AL/NL using historical league membership when a season year is available."""
+    tid = normalize_team_id(team_id)
+    yr = safe_int_year(year)
+    if tid == "HOU" and yr is not None:
+        return "NL" if yr <= 2012 else "AL"
+    if tid == "MIL" and yr is not None:
+        return "AL" if yr <= 1997 else "NL"
+    if tid in AL_TEAMS:
         return "AL"
-    if team_id in NL_TEAMS:
+    if tid in NL_TEAMS:
         return "NL"
     return "Unknown"
 
@@ -984,7 +1002,7 @@ def load_data():
     batting["primaryPos"] = batting["primaryPos"].fillna("DH")
     batting["careerPrimaryPos"] = batting["careerPrimaryPos"].fillna(batting["primaryPos"]).fillna("DH")
     batting["teamName"] = batting["teamID"].map(team_id_to_name).fillna(batting["teamID"])
-    batting["teamLeague"] = batting["teamID"].apply(team_league)
+    batting["teamLeague"] = batting.apply(lambda r: team_league(r["teamID"], r["yearID"]), axis=1)
     batting = add_rate_stats(batting)
 
     yearly = (
@@ -1004,7 +1022,7 @@ def load_data():
     yearly = yearly.merge(primary_teams, on=["playerID", "yearID"], how="left")
     yearly["primaryTeamName"] = yearly["primaryTeamID"].map(team_id_to_name).fillna(yearly["primaryTeamID"])
     yearly["primaryHistoricalTeamName"] = yearly["primaryHistoricalTeamName"].fillna(yearly["primaryTeamName"])
-    yearly["primaryLeague"] = yearly["primaryLeague"].fillna(yearly["primaryTeamID"].apply(team_league))
+    yearly["primaryLeague"] = yearly["primaryLeague"].fillna(yearly.apply(lambda r: team_league(r["primaryTeamID"], r["yearID"]), axis=1))
 
     yearly_pos = batting[["playerID", "yearID", "primaryPos"]].drop_duplicates(subset=["playerID", "yearID"])
     yearly = yearly.merge(yearly_pos, on=["playerID", "yearID"], how="left")
@@ -1030,21 +1048,21 @@ with tab_hist:
         "🔎 Historical Explorer",
         "Find individual player seasons. Split-team seasons can stay as separate team rows or be combined into one primary-team season row."
     )
-    hist_position_filter_mode = st.selectbox(
-        "Position Filter Mode",
-        ["Season Primary Position", "Career Primary Position"],
-        index=0,
-        key="hist_position_filter_mode",
-        help="Season mode filters by the player’s primary position for that season. Career mode filters by the player’s full-career primary position from Fielding.csv games."
-    )
-    hist_position_source_col = "careerPrimaryPos" if hist_position_filter_mode == "Career Primary Position" else "primaryPos"
-
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c_mode, c3, c4 = st.columns([1.05, 1.0, 1.25, 1.0, 1.35])
     with c1:
         hist_year_range = st.slider("Year Range", year_min, year_max, (default_start_hist, year_max), key="hist_year")
     with c2:
         bats_options = sorted([x for x in batting_df["bats"].dropna().unique() if str(x).strip() != ""])
         hist_bats = st.multiselect("Batting Hand", bats_options, default=bats_options, key="hist_bats")
+    with c_mode:
+        hist_position_filter_mode = st.selectbox(
+            "Position Filter Mode",
+            ["Season Primary Position", "Career Primary Position"],
+            index=0,
+            key="hist_position_filter_mode",
+            help="Season mode filters by the player’s primary position for that season. Career mode filters by the player’s full-career primary position from Fielding.csv games."
+        )
+    hist_position_source_col = "careerPrimaryPos" if hist_position_filter_mode == "Career Primary Position" else "primaryPos"
     with c3:
         pos_options = sorted([x for x in batting_df[hist_position_source_col].dropna().unique() if str(x).strip() != "" and x not in ["PH", "PR"]])
         hist_pos = st.multiselect("Primary Position", pos_options, default=pos_options, key="hist_pos")
