@@ -248,10 +248,19 @@ def apply_stat_min_filters(df, prefix):
     return df
 
 def color_trend(val):
-    if pd.isna(val): return ""
-    if val > 0: return "color: green; font-weight: bold;"
-    if val < 0: return "color: red; font-weight: bold;"
-    return "color: gray;"
+    try:
+        if pd.isna(val):
+            return ""
+        num = pd.to_numeric(str(val).replace(",", ""), errors="coerce")
+        if pd.isna(num):
+            return ""
+        if num > 0:
+            return "color: green; font-weight: bold;"
+        if num < 0:
+            return "color: red; font-weight: bold;"
+        return "color: gray;"
+    except Exception:
+        return ""
 
 def classify_trend(row):
     ops_trend = pd.to_numeric(row.get("OPS_trend", np.nan), errors="coerce")
@@ -306,10 +315,10 @@ def make_valuation_summary(row):
     proj_sb = pd.to_numeric(row.get("proj_SB", np.nan), errors="coerce")
     valuation_description = describe_valuation_index(valuation_score)
     return (
-        f"{player}'s Trend Score is {fmt_count_1(trend_score)}, Performance Score is {fmt_count_1(perf_score)}, "
+        f"{player}'s Trend Score is {fmt_count_1(trend_score)}, Current Score is {fmt_count_1(perf_score)}, "
         f"and Valuation Score is {fmt_rate_4(valuation_score)}. "
         f"That is {valuation_description}. "
-        f"The Valuation Score combines current production with recent trend direction, "
+        f"The Valuation Score combines current score with recent trend direction, "
         f"then scales the result from 0 to 1 compared with the other players in the filtered group. "
         f"If the recent pattern continues, next season projects roughly around "
         f"{fmt_rate_3(proj_ops)} OPS, {fmt_int(proj_hr)} HR, {fmt_int(proj_xbh)} doubles/triples, "
@@ -368,7 +377,7 @@ MAX_TABLE_DISPLAY_ROWS = 1000
 def _df_to_csv_bytes(df):
     return df.to_csv(index=False).encode("utf-8")
 
-def render_output_table(df, *, key, file_name, display_rows=MAX_TABLE_DISPLAY_ROWS):
+def render_output_table(df, *, key, file_name, display_rows=MAX_TABLE_DISPLAY_ROWS, style_cols=None):
     """Render a table quickly and add a CSV export button that opens cleanly in Excel."""
     table_df = df.copy()
     if len(table_df) > display_rows:
@@ -376,14 +385,21 @@ def render_output_table(df, *, key, file_name, display_rows=MAX_TABLE_DISPLAY_RO
         display_df = table_df.head(display_rows)
     else:
         display_df = table_df
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    style_cols = [c for c in (style_cols or []) if c in display_df.columns]
+    if style_cols and display_df.size <= 250_000:
+        styled_df = display_df.style.map(color_trend, subset=style_cols)
+        st.dataframe(styled_df, width="stretch", hide_index=True)
+    else:
+        st.dataframe(display_df, width="stretch", hide_index=True)
+
     st.download_button(
         "Export CSV for Excel",
         data=_df_to_csv_bytes(table_df),
         file_name=file_name,
         mime="text/csv",
         key=f"download_{key}",
-        use_container_width=False,
+        width="content",
     )
 
 def clean_feature_name(feature):
@@ -426,7 +442,7 @@ def clean_ui_columns(df):
         "hist_AB_total": "Recent AB",
         "score": "Score",
         "Trend_Score": "Trend Score",
-        "Perf_Score": "Performance Score",
+        "Perf_Score": "Current Score",
         "Valuation_Score": "Valuation Score",
     }
     df = df.rename(columns=rename_map)
@@ -1487,7 +1503,7 @@ if active_page == "Trend Value":
         count_cols=[c for c in TREND_COUNT_COLS if c in trend_sorted.columns],
         rate_cols=[c for c in TREND_RATE_COLS if c in trend_sorted.columns],
     )
-    render_output_table(trend_sorted_display, key="trend_table", file_name="trend_value.csv")
+    render_output_table(trend_sorted_display, key="trend_table", file_name="trend_value.csv", style_cols=[c for c in trend_sorted_display.columns if "Δ" in c])
     breakout_df = trend_value_df[["fullName", "bats", "OPS_trend", "HR_trend", "XBH_noHR_trend", "RBI_trend", "SB_trend"]].copy()
     top_breakouts = breakout_df.sort_values("OPS_trend", ascending=False).head(10)
     biggest_declines = breakout_df.sort_values("OPS_trend", ascending=True).head(10)
@@ -1500,11 +1516,11 @@ if active_page == "Trend Value":
     with c3:
         st.subheader("🔥 Top Breakout Players")
         breakout_table = format_display_table(top_breakouts_display, count_cols=["HR Δ", "2B+3B Δ", "RBI Δ", "SB Δ"], rate_cols=["OPS Δ"])
-        render_output_table(breakout_table, key="top_breakouts", file_name="top_breakouts.csv")
+        render_output_table(breakout_table, key="top_breakouts", file_name="top_breakouts.csv", style_cols=[c for c in breakout_table.columns if "Δ" in c])
     with c4:
         st.subheader("❄️ Biggest Declines")
         declines_table = format_display_table(biggest_declines_display, count_cols=["HR Δ", "2B+3B Δ", "RBI Δ", "SB Δ"], rate_cols=["OPS Δ"])
-        render_output_table(declines_table, key="biggest_declines", file_name="biggest_declines.csv")
+        render_output_table(declines_table, key="biggest_declines", file_name="biggest_declines.csv", style_cols=[c for c in declines_table.columns if "Δ" in c])
 
     st.subheader("Insight Summaries")
     top_breakout_row = trend_value_df.sort_values("OPS_trend", ascending=False).head(1)
@@ -1568,7 +1584,7 @@ if active_page == "Valuation":
     st.subheader("Valuation Weights")
     c5, c6 = st.columns(2)
     with c5:
-        w_current = st.number_input("Weight: Current Production", 0.0, 10.0, 1.0, key="value_w_current")
+        w_current = st.number_input("Weight: Current Score", 0.0, 10.0, 1.0, key="value_w_current")
     with c6:
         w_trend = st.number_input("Weight: Trend Score", 0.0, 10.0, 1.0, key="value_w_trend")
 
@@ -1604,9 +1620,9 @@ if active_page == "Valuation":
     c9.metric("Top Valuation Player", valuation_df.sort_values("Valuation_Score", ascending=False).iloc[0]["fullName"] if not valuation_df.empty else "N/A")
 
     valuation_display = valuation_df[["fullName", "bats", "R", "H", "2B", "3B", "HR", "RBI", "SB", "BA", "OBP", "SLG", "OPS", "Trend_Score", "Perf_Score", "Valuation_Score"]].sort_values("Valuation_Score", ascending=False).rename(columns={
-        "fullName": "Player", "bats": "Bats", "Trend_Score": "Trend Score", "Perf_Score": "Performance Score", "Valuation_Score": "Valuation Score"
+        "fullName": "Player", "bats": "Bats", "Trend_Score": "Trend Score", "Perf_Score": "Current Score", "Valuation_Score": "Valuation Score"
     })
-    valuation_table = format_display_table(clean_ui_columns(valuation_display), count_cols=["R", "H", "2B", "3B", "HR", "RBI", "SB"], rate_cols=["BA", "OBP", "SLG", "OPS"], score_cols=["Trend Score", "Performance Score", "Valuation Score"])
+    valuation_table = format_display_table(clean_ui_columns(valuation_display), count_cols=["R", "H", "2B", "3B", "HR", "RBI", "SB"], rate_cols=["BA", "OBP", "SLG", "OPS"], score_cols=["Trend Score", "Current Score", "Valuation Score"])
     render_output_table(valuation_table, key="valuation", file_name="valuation.csv")
 
     st.subheader("Valuation Insight Summaries")
