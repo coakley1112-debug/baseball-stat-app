@@ -415,7 +415,7 @@ def _numeric_plot_columns(df):
     """
     blocked = {"birthday", "birthmonth", "birthyear", "birth day", "birth month", "birth year"}
     preferred = [
-        "Age", "Games", "G", "AB", "R", "H", "2B", "3B", "HR", "RBI", "SB", "BB",
+        "Age", "G", "AB", "R", "H", "2B", "3B", "HR", "RBI", "SB", "BB",
         "BA", "OBP", "SLG", "OPS", "Current Score", "Valuation Score", "Score",
         "Debut Age", "Final Age", "Average Age"
     ]
@@ -434,14 +434,18 @@ def _numeric_plot_columns(df):
     return cols
 
 def _categorical_plot_columns(df):
-    preferred = ["Primary Position", "Position", "League", "Bats", "Team"]
-    return [c for c in preferred if c in df.columns and df[c].nunique(dropna=True) <= 40]
+    """Color-by options should stay consistent across Historical and Career scatterplots."""
+    options = []
+    for col in ["Primary Position", "Bats", "Team", "League"]:
+        if col in df.columns:
+            options.append(col)
+    return options
 
 def _prepare_historical_scatter_data(hist_df, team_col):
     """Build plot-ready data for Historical Explorer.
 
     The visible table stays clean, but the scatterplot can use internal fields such as
-    season Age and Games.
+    season Age and G.
     """
     if hist_df is None or hist_df.empty:
         return pd.DataFrame()
@@ -468,8 +472,9 @@ def _prepare_historical_scatter_data(hist_df, team_col):
             ),
             axis=1
         )
+    # Keep games labeled as G only. Do not create a duplicate "Games" field.
     if "G" in plot_df.columns:
-        plot_df["Games"] = pd.to_numeric(plot_df["G"], errors="coerce")
+        plot_df["G"] = pd.to_numeric(plot_df["G"], errors="coerce")
     return plot_df
 
 def _prepare_career_scatter_data(career_df, filtered_source_df=None):
@@ -485,8 +490,10 @@ def _prepare_career_scatter_data(career_df, filtered_source_df=None):
     plot_df["Team"] = plot_df.get("displayTeam", plot_df.get("Team", plot_df.get("teamHistoricalName", plot_df.get("primaryHistoricalTeamName", ""))))
     plot_df["Primary Position"] = plot_df.get("displayPosition", plot_df.get("Primary Position", plot_df.get("careerPrimaryPos", plot_df.get("primaryPos", ""))))
     plot_df["Bats"] = plot_df.get("bats", plot_df.get("Bats", ""))
+    plot_df["League"] = plot_df.get("League", "Unknown").replace({"AL": "American League", "NL": "National League", "": "Unknown"}).fillna("Unknown") if "League" in plot_df.columns else "Unknown"
+    # Keep games labeled as G only. Do not create a duplicate "Games" field.
     if "G" in plot_df.columns:
-        plot_df["Games"] = pd.to_numeric(plot_df["G"], errors="coerce")
+        plot_df["G"] = pd.to_numeric(plot_df["G"], errors="coerce")
 
     if filtered_source_df is not None and not filtered_source_df.empty and "playerID" in plot_df.columns:
         src = filtered_source_df.copy()
@@ -607,7 +614,7 @@ def _scatter_size_encoding(chart_df, size_col):
     return alt.Size(
         f"{size_col}:Q",
         title=size_col,
-        scale=alt.Scale(domain=[low, high], range=[45, 1700], clamp=True),
+        scale=alt.Scale(domain=[low, high], range=[20, 300], clamp=True),
         legend=alt.Legend(title=size_col)
     )
 
@@ -620,12 +627,18 @@ def _scatter_color_encoding(chart_df, color_col):
     col_lower = color_col.lower()
 
     if "league" in col_lower:
-        domain = ["American League", "AL", "National League", "NL", "Unknown", "Unknown League", ""]
-        colors = ["#08519c", "#08519c", "#fb6a4a", "#fb6a4a", "#ffffff", "#ffffff", "#ffffff"]
+        chart_df[color_col] = (
+            chart_df[color_col]
+            .replace({"AL": "American League", "NL": "National League", "Unknown League": "Unknown", "": "Unknown"})
+            .fillna("Unknown")
+        )
         return alt.Color(
             f"{color_col}:N",
             title=color_col,
-            scale=alt.Scale(domain=domain, range=colors),
+            scale=alt.Scale(
+                domain=["American League", "National League", "Unknown"],
+                range=["#08519c", "#fb6a4a", "#ffffff"]
+            ),
             legend=alt.Legend(title=color_col)
         )
 
@@ -640,12 +653,18 @@ def _scatter_color_encoding(chart_df, color_col):
         )
 
     if "position" in col_lower or color_col in ["POS", "Primary Position"]:
-        domain = ["1B", "2B", "SS", "3B", "OF", "DH", "C", "P", "Unknown", ""]
-        colors = ["#08306b", "#8c510a", "#238b45", "#ffd92f", "#e31a1c", "#756bb1", "#000000", "#ffffff", "#bdbdbd", "#bdbdbd"]
+        chart_df[color_col] = (
+            chart_df[color_col]
+            .replace({"": "Unknown"})
+            .fillna("Unknown")
+        )
         return alt.Color(
             f"{color_col}:N",
             title=color_col,
-            scale=alt.Scale(domain=domain, range=colors),
+            scale=alt.Scale(
+                domain=["1B", "2B", "SS", "3B", "OF", "DH", "C", "P", "Unknown"],
+                range=["#08306b", "#8c510a", "#238b45", "#ffd92f", "#e31a1c", "#756bb1", "#000000", "#ffffff", "#bdbdbd"]
+            ),
             legend=alt.Legend(title=color_col)
         )
 
@@ -759,6 +778,14 @@ def render_scatterplot_section(plot_df, *, key_prefix, title="Visualize Results"
         help="Lower values make the chart faster when a filter returns a very large table."
     )
 
+    view_mode = st.radio(
+        "Scatterplot View",
+        ["Focused View", "Full Outlier View"],
+        horizontal=True,
+        key=f"{key_prefix}_scatter_view_mode",
+        help="Focused View keeps the main cluster readable. Full Outlier View expands the axes to include every outlier."
+    )
+
     chart_df = plot_df.copy()
     chart_df[x_col] = pd.to_numeric(chart_df[x_col], errors="coerce")
     chart_df[y_col] = pd.to_numeric(chart_df[y_col], errors="coerce")
@@ -771,11 +798,17 @@ def render_scatterplot_section(plot_df, *, key_prefix, title="Visualize Results"
         chart_df = chart_df.sort_values(y_col, ascending=False).head(max_points)
         st.caption(f"Showing {max_points:,} plotted points for speed. Narrow filters for a complete visual.")
 
-    tooltip_cols = [c for c in ["Player", "Year", "Team", "Primary Position", "Bats", "League", x_col, y_col, "Games", "Age", "Debut Age", "Final Age", "Average Age", "OPS", "HR", "SB"] if c in chart_df.columns]
+    tooltip_cols = [c for c in ["Player", "Year", "Team", "Primary Position", "Bats", "League", x_col, y_col, "G", "Age", "Debut Age", "Final Age", "Average Age", "OPS", "HR", "SB"] if c in chart_df.columns]
     tooltip_cols = list(dict.fromkeys(tooltip_cols))
 
-    x_scale, x_axis = _axis_config_for_column(x_col, chart_df[x_col])
-    y_scale, y_axis = _axis_config_for_column(y_col, chart_df[y_col])
+    if view_mode == "Full Outlier View":
+        x_scale = alt.Scale(zero=False)
+        y_scale = alt.Scale(zero=False)
+        x_axis = alt.Axis(title=x_col, format="d" if str(x_col).lower() == "year" else None)
+        y_axis = alt.Axis(title=y_col, format="d" if str(y_col).lower() == "year" else None)
+    else:
+        x_scale, x_axis = _axis_config_for_column(x_col, chart_df[x_col])
+        y_scale, y_axis = _axis_config_for_column(y_col, chart_df[y_col])
 
     enc = {
         "x": alt.X(f"{x_col}:Q", title=x_col, scale=x_scale, axis=x_axis),
