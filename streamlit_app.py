@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import altair as alt
 from matplotlib.ticker import MaxNLocator
 from pathlib import Path
 
@@ -298,9 +299,9 @@ def make_trend_insight_summary(row):
         f"OPS trend is {fmt_rate_4(ops_trend)} per year, HR trend is {fmt_count_1(hr_trend)}, "
         f"2B+3B trend is {fmt_count_1(xbh_trend)}, RBI trend is {fmt_count_1(rbi_trend)}, "
         f"and SB trend is {fmt_count_1(sb_trend)}. "
-        f"If the recent pattern continues, next season projects roughly around "
-        f"{fmt_rate_3(proj_ops)} OPS, {fmt_int(proj_hr)} HR, {fmt_int(proj_xbh)} doubles/triples, "
-        f"{fmt_int(proj_rbi)} RBI, and {fmt_int(proj_sb)} SB."
+        f"If the recent pattern continues, the next-season trend estimate is roughly "
+        f"{fmt_rate_4(proj_ops)} OPS, {fmt_count_1(proj_hr)} HR, {fmt_count_1(proj_xbh)} doubles/triples, "
+        f"{fmt_count_1(proj_rbi)} RBI, and {fmt_count_1(proj_sb)} SB."
     )
 
 def make_valuation_summary(row):
@@ -320,9 +321,9 @@ def make_valuation_summary(row):
         f"That is {valuation_description}. "
         f"The Valuation Score combines current score with recent trend direction, "
         f"then scales the result from 0 to 1 compared with the other players in the filtered group. "
-        f"If the recent pattern continues, next season projects roughly around "
-        f"{fmt_rate_3(proj_ops)} OPS, {fmt_int(proj_hr)} HR, {fmt_int(proj_xbh)} doubles/triples, "
-        f"{fmt_int(proj_rbi)} RBI, and {fmt_int(proj_sb)} SB."
+        f"If the recent pattern continues, the next-season trend estimate is roughly "
+        f"{fmt_rate_4(proj_ops)} OPS, {fmt_count_1(proj_hr)} HR, {fmt_count_1(proj_xbh)} doubles/triples, "
+        f"{fmt_count_1(proj_rbi)} RBI, and {fmt_count_1(proj_sb)} SB."
     )
 
 def render_section_header(title, note):
@@ -348,9 +349,12 @@ def top_bar_chart(df, name_col, value_col, title, top_n=10):
     ax.invert_yaxis()
     st.pyplot(fig)
 
-def format_display_table(df, count_cols=None, rate_cols=None, score_cols=None):
+def format_display_table(df, count_cols=None, rate_cols=None, score_cols=None, count_decimals=0, rate_decimals=3):
     """Return a plain DataFrame for maximum Streamlit Cloud stability.
     Formatting is handled by rounding numeric columns instead of pandas Styler.
+
+    count_decimals / rate_decimals let the Trend page keep change values readable:
+    counting-stat changes use 1 decimal, while OPS/BA/OBP/SLG changes use 4 decimals.
     """
     df = df.copy()
     count_cols = count_cols or []
@@ -358,10 +362,10 @@ def format_display_table(df, count_cols=None, rate_cols=None, score_cols=None):
     score_cols = score_cols or []
     for col in count_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").round(0)
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(count_decimals)
     for col in rate_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").round(3)
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(rate_decimals)
     for col in score_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").round(4 if col == "Valuation Score" else 1)
@@ -401,6 +405,192 @@ def render_output_table(df, *, key, file_name, display_rows=MAX_TABLE_DISPLAY_RO
         key=f"download_{key}",
         width="content",
     )
+
+
+def _numeric_plot_columns(df):
+    """Return useful numeric columns for chart axes."""
+    preferred = [
+        "Age", "Games", "G", "AB", "R", "H", "2B", "3B", "HR", "RBI", "SB", "BB",
+        "BA", "OBP", "SLG", "OPS", "Current Score", "Valuation Score", "Score"
+    ]
+    cols = []
+    for c in preferred:
+        if c in df.columns and c not in cols:
+            vals = pd.to_numeric(df[c], errors="coerce")
+            if vals.notna().sum() > 0:
+                cols.append(c)
+    for c in df.columns:
+        if c not in cols:
+            vals = pd.to_numeric(df[c], errors="coerce")
+            if vals.notna().sum() > 0 and not str(c).lower().endswith("id"):
+                cols.append(c)
+    return cols
+
+def _categorical_plot_columns(df):
+    preferred = ["Primary Position", "Position", "League", "Bats", "Team"]
+    return [c for c in preferred if c in df.columns and df[c].nunique(dropna=True) <= 40]
+
+def _prepare_historical_scatter_data(hist_df, team_col):
+    """Build plot-ready data for Historical Explorer.
+
+    The visible table stays clean, but the scatterplot can use internal fields such as
+    season Age and Games.
+    """
+    if hist_df is None or hist_df.empty:
+        return pd.DataFrame()
+    plot_df = hist_df.copy()
+    plot_df["Player"] = plot_df.get("fullName", "")
+    plot_df["Year"] = pd.to_numeric(plot_df.get("yearID"), errors="coerce")
+    plot_df["Team"] = plot_df.get(team_col, plot_df.get("teamHistoricalName", plot_df.get("primaryHistoricalTeamName", "")))
+    plot_df["Primary Position"] = plot_df.get("displayPosition", plot_df.get("primaryPos", plot_df.get("careerPrimaryPos", "")))
+    plot_df["Bats"] = plot_df.get("bats", "")
+    if "teamLeague" in plot_df.columns:
+        plot_df["League"] = plot_df["teamLeague"]
+    elif "primaryLeague" in plot_df.columns:
+        plot_df["League"] = plot_df["primaryLeague"]
+    else:
+        plot_df["League"] = ""
+
+    if {"yearID", "birthYear"}.issubset(plot_df.columns):
+        plot_df["Age"] = plot_df.apply(
+            lambda r: baseball_age_for_season(
+                r.get("yearID"),
+                r.get("birthYear"),
+                r.get("birthMonth", np.nan),
+                r.get("birthDay", np.nan)
+            ),
+            axis=1
+        )
+    if "G" in plot_df.columns:
+        plot_df["Games"] = pd.to_numeric(plot_df["G"], errors="coerce")
+    return plot_df
+
+def _prepare_career_scatter_data(career_df, filtered_source_df=None):
+    """Build plot-ready data for Career Totals.
+
+    Career age is less natural than season age, so this adds Debut Age, Final Age,
+    and Average Age when birth/year fields are available in the filtered source.
+    """
+    if career_df is None or career_df.empty:
+        return pd.DataFrame()
+    plot_df = career_df.copy()
+    plot_df["Player"] = plot_df.get("fullName", plot_df.get("Player", ""))
+    plot_df["Team"] = plot_df.get("displayTeam", plot_df.get("Team", plot_df.get("teamHistoricalName", plot_df.get("primaryHistoricalTeamName", ""))))
+    plot_df["Primary Position"] = plot_df.get("displayPosition", plot_df.get("Primary Position", plot_df.get("careerPrimaryPos", plot_df.get("primaryPos", ""))))
+    plot_df["Bats"] = plot_df.get("bats", plot_df.get("Bats", ""))
+    if "G" in plot_df.columns:
+        plot_df["Games"] = pd.to_numeric(plot_df["G"], errors="coerce")
+
+    if filtered_source_df is not None and not filtered_source_df.empty and "playerID" in plot_df.columns:
+        src = filtered_source_df.copy()
+        if {"yearID", "birthYear"}.issubset(src.columns):
+            src["Season Age"] = src.apply(
+                lambda r: baseball_age_for_season(
+                    r.get("yearID"),
+                    r.get("birthYear"),
+                    r.get("birthMonth", np.nan),
+                    r.get("birthDay", np.nan)
+                ),
+                axis=1
+            )
+            weight_col = "AB" if "AB" in src.columns else ("G" if "G" in src.columns else None)
+            if weight_col:
+                src["_age_weight"] = pd.to_numeric(src[weight_col], errors="coerce").fillna(0)
+                def wavg(g):
+                    ages = pd.to_numeric(g["Season Age"], errors="coerce")
+                    weights = pd.to_numeric(g["_age_weight"], errors="coerce").fillna(0)
+                    mask = ages.notna() & (weights > 0)
+                    if mask.sum() == 0:
+                        return ages.mean()
+                    return np.average(ages[mask], weights=weights[mask])
+                age_summary = src.groupby("playerID").apply(
+                    lambda g: pd.Series({
+                        "Debut Age": pd.to_numeric(g["Season Age"], errors="coerce").min(),
+                        "Final Age": pd.to_numeric(g["Season Age"], errors="coerce").max(),
+                        "Average Age": wavg(g)
+                    })
+                ).reset_index()
+            else:
+                age_summary = src.groupby("playerID")["Season Age"].agg(
+                    **{"Debut Age": "min", "Final Age": "max", "Average Age": "mean"}
+                ).reset_index()
+            plot_df = plot_df.merge(age_summary, on="playerID", how="left")
+    return plot_df
+
+def render_scatterplot_section(plot_df, *, key_prefix, title="Visualize Results"):
+    """Interactive scatterplot for the current filtered result set."""
+    if plot_df is None or plot_df.empty:
+        return
+
+    plot_df = plot_df.copy()
+    numeric_cols = _numeric_plot_columns(plot_df)
+    if len(numeric_cols) < 2:
+        return
+
+    st.subheader(title)
+    st.caption(
+        "The scatterplot uses the current filtered results. It can also use internal chart fields "
+        "like Age and Games even when those fields are not shown in the output table."
+    )
+
+    default_x = "HR" if "HR" in numeric_cols else numeric_cols[0]
+    default_y = "SB" if "SB" in numeric_cols else ("OPS" if "OPS" in numeric_cols else numeric_cols[min(1, len(numeric_cols)-1)])
+
+    p1, p2, p3, p4 = st.columns([1, 1, 1, 1])
+    with p1:
+        x_col = st.selectbox("X-axis", numeric_cols, index=numeric_cols.index(default_x), key=f"{key_prefix}_scatter_x")
+    with p2:
+        y_col = st.selectbox("Y-axis", numeric_cols, index=numeric_cols.index(default_y), key=f"{key_prefix}_scatter_y")
+    cat_options = ["None"] + _categorical_plot_columns(plot_df)
+    with p3:
+        color_col = st.selectbox("Color by", cat_options, index=0, key=f"{key_prefix}_scatter_color")
+    size_options = ["None"] + numeric_cols
+    with p4:
+        size_col = st.selectbox("Size by", size_options, index=0, key=f"{key_prefix}_scatter_size")
+
+    max_points = st.slider(
+        "Maximum points to plot",
+        min_value=250,
+        max_value=5000,
+        value=min(1500, max(250, len(plot_df))),
+        step=250,
+        key=f"{key_prefix}_scatter_max_points",
+        help="Lower values make the chart faster when a filter returns a very large table."
+    )
+
+    chart_df = plot_df.copy()
+    chart_df[x_col] = pd.to_numeric(chart_df[x_col], errors="coerce")
+    chart_df[y_col] = pd.to_numeric(chart_df[y_col], errors="coerce")
+    chart_df = chart_df.dropna(subset=[x_col, y_col])
+    if chart_df.empty:
+        st.info("No rows have valid values for both selected axes.")
+        return
+
+    if len(chart_df) > max_points:
+        chart_df = chart_df.sort_values(y_col, ascending=False).head(max_points)
+        st.caption(f"Showing {max_points:,} plotted points for speed. Narrow filters for a complete visual.")
+
+    tooltip_cols = [c for c in ["Player", "Year", "Team", "Primary Position", "Bats", "League", x_col, y_col, "Games", "Age", "Debut Age", "Final Age", "Average Age", "OPS", "HR", "SB"] if c in chart_df.columns]
+    tooltip_cols = list(dict.fromkeys(tooltip_cols))
+
+    enc = {
+        "x": alt.X(f"{x_col}:Q", title=x_col),
+        "y": alt.Y(f"{y_col}:Q", title=y_col),
+        "tooltip": [alt.Tooltip(c, title=c) for c in tooltip_cols],
+    }
+    if color_col != "None" and color_col in chart_df.columns:
+        enc["color"] = alt.Color(f"{color_col}:N", title=color_col)
+    if size_col != "None" and size_col in chart_df.columns:
+        enc["size"] = alt.Size(f"{size_col}:Q", title=size_col, legend=alt.Legend(title=size_col))
+
+    chart = (
+        alt.Chart(chart_df)
+        .mark_circle(opacity=0.72)
+        .encode(**enc)
+        .interactive()
+        .properties(height=520)
+    )
+    st.altair_chart(chart, width="stretch")
 
 def clean_feature_name(feature):
     """Make model feature names readable for the UI."""
@@ -1113,8 +1303,14 @@ default_start_hist = max(year_min, 2010)
 default_start_leaders = max(year_min, 2020)
 
 PAGE_OPTIONS = ["Historical Explorer", "Career Totals", "Leaderboards", "Comparison Tool", "Trend Value", "Valuation", "ML Predictions"]
-active_page = st.sidebar.radio("Choose Page", PAGE_OPTIONS, index=0)
+
+# Persist navigation and page-specific widget settings.
+# Every filter/toggle/sort widget below uses a stable key, so Streamlit keeps its
+# last value in st.session_state when the user moves to another page and returns.
+st.session_state.setdefault("active_page", "Historical Explorer")
+active_page = st.sidebar.radio("Choose Page", PAGE_OPTIONS, key="active_page")
 st.sidebar.caption("Speed note: using page navigation instead of tabs prevents Streamlit from recalculating every page after each filter change.")
+st.sidebar.caption("Filters are remembered when you move between pages during the same app session.")
 
 if active_page == "Historical Explorer":
     render_section_header(
@@ -1243,6 +1439,9 @@ if active_page == "Historical Explorer":
     st.divider()
     hist_table = format_display_table(clean_ui_columns(hist_display), count_cols=["Year", "R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB"], rate_cols=["BA", "OBP", "SLG", "OPS"])
     render_output_table(hist_table, key="historical_explorer", file_name="historical_explorer.csv")
+    st.divider()
+    hist_plot_df = _prepare_historical_scatter_data(hist, team_col_for_display)
+    render_scatterplot_section(hist_plot_df, key_prefix="hist", title="Visualize Historical Results")
 
 if active_page == "Career Totals":
     render_section_header(
@@ -1366,6 +1565,9 @@ if active_page == "Career Totals":
     st.divider()
     career_table = format_display_table(clean_ui_columns(career_display), count_cols=["R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB"], rate_cols=["BA", "OBP", "SLG", "OPS"])
     render_output_table(career_table, key="career_totals", file_name="career_totals.csv")
+    st.divider()
+    career_plot_df = _prepare_career_scatter_data(career_totals, filtered_career)
+    render_scatterplot_section(career_plot_df, key_prefix="career", title="Visualize Career Results")
 
 if active_page == "Leaderboards":
     render_section_header("🏆 Leaderboards", "Build custom offensive rankings with weighted stats, filters, summary cards, and charts.")
@@ -1461,6 +1663,7 @@ if active_page == "Trend Value":
     max_year_trend = int(yearly_df["yearID"].max())
     recent_years_trend = list(range(max_year_trend - lag_trend + 1, max_year_trend + 1))
     st.write(f"Analyzing seasons: **{recent_years_trend[0]}–{recent_years_trend[-1]}**")
+    st.caption(f"Trend estimates are next-season estimates for **{max_year_trend + 1}**, calculated as the player's latest season value plus the yearly trend slope from the selected window.")
     recent_data_trend = yearly_df[yearly_df["yearID"].isin(recent_years_trend)].copy().sort_values(["playerID", "yearID"])
 
     agg_trend = recent_data_trend.groupby(["playerID", "fullName", "bats"], as_index=False)[["G", "R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "HBP", "SF"]].sum()
@@ -1506,6 +1709,8 @@ if active_page == "Trend Value":
         trend_sorted.head(1000),
         count_cols=[c for c in TREND_COUNT_COLS if c in trend_sorted.columns],
         rate_cols=[c for c in TREND_RATE_COLS if c in trend_sorted.columns],
+        count_decimals=1,
+        rate_decimals=4,
     )
     render_output_table(trend_sorted_display, key="trend_table", file_name="trend_value.csv", style_cols=[c for c in trend_sorted_display.columns if "Δ" in c])
     breakout_df = trend_value_df[["fullName", "bats", "OPS_trend", "HR_trend", "XBH_noHR_trend", "RBI_trend", "SB_trend"]].copy()
@@ -1519,11 +1724,11 @@ if active_page == "Trend Value":
     c3, c4 = st.columns(2)
     with c3:
         st.subheader("🔥 Top Breakout Players")
-        breakout_table = format_display_table(top_breakouts_display, count_cols=["HR Δ", "2B+3B Δ", "RBI Δ", "SB Δ"], rate_cols=["OPS Δ"])
+        breakout_table = format_display_table(top_breakouts_display, count_cols=["HR Δ", "2B+3B Δ", "RBI Δ", "SB Δ"], rate_cols=["OPS Δ"], count_decimals=1, rate_decimals=4)
         render_output_table(breakout_table, key="top_breakouts", file_name="top_breakouts.csv", style_cols=[c for c in breakout_table.columns if "Δ" in c])
     with c4:
         st.subheader("❄️ Biggest Declines")
-        declines_table = format_display_table(biggest_declines_display, count_cols=["HR Δ", "2B+3B Δ", "RBI Δ", "SB Δ"], rate_cols=["OPS Δ"])
+        declines_table = format_display_table(biggest_declines_display, count_cols=["HR Δ", "2B+3B Δ", "RBI Δ", "SB Δ"], rate_cols=["OPS Δ"], count_decimals=1, rate_decimals=4)
         render_output_table(declines_table, key="biggest_declines", file_name="biggest_declines.csv", style_cols=[c for c in declines_table.columns if "Δ" in c])
 
     st.subheader("Insight Summaries")
