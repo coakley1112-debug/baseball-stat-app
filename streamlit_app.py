@@ -408,10 +408,16 @@ def render_output_table(df, *, key, file_name, display_rows=MAX_TABLE_DISPLAY_RO
 
 
 def _numeric_plot_columns(df):
-    """Return useful numeric columns for chart axes."""
+    """Return useful numeric columns for chart axes.
+
+    The chart can use internal fields such as Age/Games, but it intentionally
+    hides backend IDs and raw birth-date fields from the dropdowns.
+    """
+    blocked = {"birthday", "birthmonth", "birthyear", "birth day", "birth month", "birth year"}
     preferred = [
         "Age", "Games", "G", "AB", "R", "H", "2B", "3B", "HR", "RBI", "SB", "BB",
-        "BA", "OBP", "SLG", "OPS", "Current Score", "Valuation Score", "Score"
+        "BA", "OBP", "SLG", "OPS", "Current Score", "Valuation Score", "Score",
+        "Debut Age", "Final Age", "Average Age"
     ]
     cols = []
     for c in preferred:
@@ -420,7 +426,8 @@ def _numeric_plot_columns(df):
             if vals.notna().sum() > 0:
                 cols.append(c)
     for c in df.columns:
-        if c not in cols:
+        c_key = str(c).replace("_", " ").lower().strip()
+        if c not in cols and c_key not in blocked:
             vals = pd.to_numeric(df[c], errors="coerce")
             if vals.notna().sum() > 0 and not str(c).lower().endswith("id"):
                 cols.append(c)
@@ -517,6 +524,200 @@ def _prepare_career_scatter_data(career_df, filtered_source_df=None):
             plot_df = plot_df.merge(age_summary, on="playerID", how="left")
     return plot_df
 
+def _year_axis_domain(series):
+    """Zoom year axes around the dense part of the plotted data.
+
+    This prevents a few very old/new rows from forcing a huge 1871-2025 range when
+    nearly all visible dots are clustered in a narrower era.
+    """
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) < 10:
+        return None
+    full_min, full_max = float(s.min()), float(s.max())
+    q_low, q_high = float(s.quantile(0.02)), float(s.quantile(0.98))
+    if not np.isfinite(q_low) or not np.isfinite(q_high) or q_high <= q_low:
+        return None
+    full_span = full_max - full_min
+    dense_span = q_high - q_low
+    # Only zoom if the dense range is meaningfully tighter than the full range.
+    if full_span > 20 and dense_span < 0.75 * full_span:
+        pad = max(1, round(dense_span * 0.06))
+        return [int(np.floor(q_low - pad)), int(np.ceil(q_high + pad))]
+    return [int(np.floor(full_min)), int(np.ceil(full_max))]
+
+def _smart_axis_domain(series, pad=0.08, q_low=0.05, q_high=0.95):
+    """Fit scatterplot axes to the dense part of the currently plotted data.
+
+    This keeps charts readable when one or two outliers would otherwise force a
+    huge empty range. It uses percentile clipping plus a small padding.
+    """
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) < 3:
+        return None
+    low = float(s.quantile(q_low))
+    high = float(s.quantile(q_high))
+    if not np.isfinite(low) or not np.isfinite(high):
+        return None
+    if high <= low:
+        val = float(s.median()) if len(s) else 0.0
+        width = max(abs(val) * 0.05, 1.0)
+        return [val - width, val + width]
+    padding = (high - low) * pad
+    return [low - padding, high + padding]
+
+
+def _axis_config_for_column(col_name, series):
+    """Return an Altair scale/axis pair tuned for the selected statistic."""
+    name = str(col_name).lower().strip()
+    domain = _smart_axis_domain(series)
+    axis_kwargs = {"title": col_name}
+
+    if name == "year":
+        domain = _year_axis_domain(series) or domain
+        axis_kwargs["format"] = "d"
+    elif name == "debut age":
+        axis_kwargs["values"] = [18, 20, 22, 24, 26, 28]
+    elif name == "final age":
+        axis_kwargs["values"] = [32, 34, 36, 38, 40, 42]
+    elif name == "average age":
+        axis_kwargs["values"] = [23, 26, 29, 32, 35, 38, 41]
+    elif name in {"ba", "avg", "batting average", "obp", "slg", "ops"}:
+        axis_kwargs["format"] = ".3f" if name != "ops" else ".3f"
+
+    return alt.Scale(domain=domain, zero=False) if domain else alt.Scale(zero=False), alt.Axis(**axis_kwargs)
+
+
+def _scatter_size_encoding(chart_df, size_col):
+    """Scale dot size dynamically to the filtered data.
+
+    Uses the 5th-95th percentile domain so one extreme outlier does not make all
+    other dots look the same size.
+    """
+    if size_col == "None" or size_col not in chart_df.columns:
+        return None
+    vals = pd.to_numeric(chart_df[size_col], errors="coerce").dropna()
+    if vals.empty:
+        return None
+    low = float(vals.quantile(0.05))
+    high = float(vals.quantile(0.95))
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        low, high = float(vals.min()), float(vals.max())
+    if high <= low:
+        high = low + 1e-9
+    return alt.Size(
+        f"{size_col}:Q",
+        title=size_col,
+        scale=alt.Scale(domain=[low, high], range=[45, 1700], clamp=True),
+        legend=alt.Legend(title=size_col)
+    )
+
+
+def _scatter_color_encoding(chart_df, color_col):
+    """Consistent color rules for league, handedness, team, and position scatterplots."""
+    if color_col == "None" or color_col not in chart_df.columns:
+        return None
+
+    col_lower = color_col.lower()
+
+    if "league" in col_lower:
+        domain = ["American League", "AL", "National League", "NL", "Unknown", "Unknown League", ""]
+        colors = ["#08519c", "#08519c", "#fb6a4a", "#fb6a4a", "#ffffff", "#ffffff", "#ffffff"]
+        return alt.Color(
+            f"{color_col}:N",
+            title=color_col,
+            scale=alt.Scale(domain=domain, range=colors),
+            legend=alt.Legend(title=color_col)
+        )
+
+    if color_col == "Bats":
+        domain = ["L", "B", "R", "Unknown", ""]
+        colors = ["#2ca25f", "#3182bd", "#de2d26", "#bdbdbd", "#bdbdbd"]
+        return alt.Color(
+            f"{color_col}:N",
+            title=color_col,
+            scale=alt.Scale(domain=domain, range=colors),
+            legend=alt.Legend(title=color_col)
+        )
+
+    if "position" in col_lower or color_col in ["POS", "Primary Position"]:
+        domain = ["1B", "2B", "SS", "3B", "OF", "DH", "C", "P", "Unknown", ""]
+        colors = ["#08306b", "#8c510a", "#238b45", "#ffd92f", "#e31a1c", "#756bb1", "#000000", "#ffffff", "#bdbdbd", "#bdbdbd"]
+        return alt.Color(
+            f"{color_col}:N",
+            title=color_col,
+            scale=alt.Scale(domain=domain, range=colors),
+            legend=alt.Legend(title=color_col)
+        )
+
+    if color_col == "Team" and "League" in chart_df.columns:
+        # Team colors: National League teams get lighter reddish shades;
+        # American League teams get darker bluish shades. Unknown teams stay gray/white.
+        teams = [t for t in sorted(chart_df["Team"].dropna().astype(str).unique()) if t]
+        al_palette = ["#08306b", "#08519c", "#2171b5", "#4292c6", "#6baed6", "#3182bd", "#084594", "#0868ac"]
+        nl_palette = ["#fee0d2", "#fcbba1", "#fc9272", "#fb6a4a", "#ef3b2c", "#fcae91", "#fdd0a2", "#e34a33"]
+        other_palette = ["#bdbdbd", "#ffffff"]
+        domain, colors = [], []
+        for i, team in enumerate(teams):
+            league_vals = chart_df.loc[chart_df["Team"].astype(str) == team, "League"].astype(str)
+            league = league_vals.mode().iloc[0] if not league_vals.mode().empty else "Unknown"
+            domain.append(team)
+            if league in ["American League", "AL"]:
+                colors.append(al_palette[i % len(al_palette)])
+            elif league in ["National League", "NL"]:
+                colors.append(nl_palette[i % len(nl_palette)])
+            else:
+                colors.append(other_palette[i % len(other_palette)])
+        return alt.Color(
+            f"{color_col}:N",
+            title=color_col,
+            scale=alt.Scale(domain=domain, range=colors),
+            legend=alt.Legend(title=color_col)
+        )
+
+    return alt.Color(f"{color_col}:N", title=color_col, legend=alt.Legend(title=color_col))
+
+
+def _best_fit_stats(chart_df, x_col, y_col):
+    """Compute linear best-fit statistics for the selected scatterplot axes."""
+    fit_df = chart_df[[x_col, y_col]].copy()
+    fit_df[x_col] = pd.to_numeric(fit_df[x_col], errors="coerce")
+    fit_df[y_col] = pd.to_numeric(fit_df[y_col], errors="coerce")
+    fit_df = fit_df.dropna()
+    fit_df = fit_df[np.isfinite(fit_df[x_col]) & np.isfinite(fit_df[y_col])]
+    if len(fit_df) < 3 or fit_df[x_col].nunique() < 2 or fit_df[y_col].nunique() < 2:
+        return None
+    x = fit_df[x_col].to_numpy(dtype=float)
+    y = fit_df[y_col].to_numpy(dtype=float)
+    slope, intercept = np.polyfit(x, y, 1)
+    corr = float(np.corrcoef(x, y)[0, 1])
+    r2 = corr ** 2 if np.isfinite(corr) else np.nan
+    x_min, x_max = float(np.nanmin(x)), float(np.nanmax(x))
+    line_df = pd.DataFrame({
+        x_col: [x_min, x_max],
+        y_col: [slope * x_min + intercept, slope * x_max + intercept]
+    })
+    return {
+        "slope": slope,
+        "intercept": intercept,
+        "corr": corr,
+        "r2": r2,
+        "line_df": line_df,
+        "n": len(fit_df)
+    }
+
+
+def _format_equation_number(value):
+    if not np.isfinite(value):
+        return "nan"
+    if abs(value) >= 100:
+        return f"{value:.1f}"
+    if abs(value) >= 10:
+        return f"{value:.2f}"
+    if abs(value) >= 1:
+        return f"{value:.3f}"
+    return f"{value:.4f}"
+
+
 def render_scatterplot_section(plot_df, *, key_prefix, title="Visualize Results"):
     """Interactive scatterplot for the current filtered result set."""
     if plot_df is None or plot_df.empty:
@@ -573,24 +774,59 @@ def render_scatterplot_section(plot_df, *, key_prefix, title="Visualize Results"
     tooltip_cols = [c for c in ["Player", "Year", "Team", "Primary Position", "Bats", "League", x_col, y_col, "Games", "Age", "Debut Age", "Final Age", "Average Age", "OPS", "HR", "SB"] if c in chart_df.columns]
     tooltip_cols = list(dict.fromkeys(tooltip_cols))
 
+    x_scale, x_axis = _axis_config_for_column(x_col, chart_df[x_col])
+    y_scale, y_axis = _axis_config_for_column(y_col, chart_df[y_col])
+
     enc = {
-        "x": alt.X(f"{x_col}:Q", title=x_col),
-        "y": alt.Y(f"{y_col}:Q", title=y_col),
+        "x": alt.X(f"{x_col}:Q", title=x_col, scale=x_scale, axis=x_axis),
+        "y": alt.Y(f"{y_col}:Q", title=y_col, scale=y_scale, axis=y_axis),
         "tooltip": [alt.Tooltip(c, title=c) for c in tooltip_cols],
     }
-    if color_col != "None" and color_col in chart_df.columns:
-        enc["color"] = alt.Color(f"{color_col}:N", title=color_col)
-    if size_col != "None" and size_col in chart_df.columns:
-        enc["size"] = alt.Size(f"{size_col}:Q", title=size_col, legend=alt.Legend(title=size_col))
 
-    chart = (
+    color_encoding = _scatter_color_encoding(chart_df, color_col)
+    if color_encoding is not None:
+        enc["color"] = color_encoding
+
+    size_encoding = _scatter_size_encoding(chart_df, size_col)
+    if size_encoding is not None:
+        enc["size"] = size_encoding
+
+    mark_kwargs = {"opacity": 0.74, "stroke": "#444444", "strokeWidth": 0.45}
+    if size_encoding is None:
+        mark_kwargs["size"] = 85
+
+    points = (
         alt.Chart(chart_df)
-        .mark_circle(opacity=0.72)
+        .mark_circle(**mark_kwargs)
         .encode(**enc)
-        .interactive()
-        .properties(height=520)
     )
+
+    fit = _best_fit_stats(chart_df, x_col, y_col)
+    chart = points
+    if fit is not None:
+        fit_line = (
+            alt.Chart(fit["line_df"])
+            .mark_line(color="#111111", strokeWidth=2.5, strokeDash=[8, 5])
+            .encode(
+                x=alt.X(f"{x_col}:Q", scale=x_scale),
+                y=alt.Y(f"{y_col}:Q", scale=y_scale),
+            )
+        )
+        chart = points + fit_line
+
+    chart = chart.interactive().properties(height=520)
     st.altair_chart(chart, width="stretch")
+
+    if fit is not None:
+        sign = "+" if fit["intercept"] >= 0 else "-"
+        equation = f"{y_col} = {_format_equation_number(fit['slope'])} × {x_col} {sign} {_format_equation_number(abs(fit['intercept']))}"
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Correlation (r)", f"{fit['corr']:.3f}")
+        m2.metric("R²", f"{fit['r2']:.3f}")
+        m3.metric("Rows Used", f"{fit['n']:,}")
+        st.caption(f"Best-fit line: {equation}")
+    else:
+        st.caption("Best-fit line unavailable because there are not enough valid numeric points or one axis has no variation.")
 
 def clean_feature_name(feature):
     """Make model feature names readable for the UI."""
