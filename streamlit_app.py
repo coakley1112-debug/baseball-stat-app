@@ -1833,6 +1833,26 @@ PAGE_OPTIONS = ["Historical Explorer", "Career Totals", "Leaderboards", "Compari
 # Stable widget keys plus radio-style page navigation preserve filters and charts
 # when moving between pages during the same session.
 
+# Keep widget values even when their page is not rendered.
+# Streamlit normally cleans up widget state for widgets that disappear when switching pages.
+# This safe self-assignment interrupts that cleanup, while skipping button/download keys
+# because Streamlit forbids programmatic assignment for those widgets.
+for _state_key in list(st.session_state.keys()):
+    _key_text = str(_state_key).lower()
+    if (
+        _key_text.startswith("download")
+        or _key_text.startswith("export")
+        or _key_text.startswith("button")
+        or _key_text.startswith("form_submit")
+        or "download" in _key_text
+        or "export_csv" in _key_text
+    ):
+        continue
+    try:
+        st.session_state[_state_key] = st.session_state[_state_key]
+    except Exception:
+        pass
+
 st.session_state.setdefault("active_page", "Historical Explorer")
 active_page = st.sidebar.radio("Choose Page", PAGE_OPTIONS, key="active_page")
 st.sidebar.caption("Speed note: using page navigation instead of tabs prevents Streamlit from recalculating every page after each filter change.")
@@ -2439,11 +2459,27 @@ if active_page == "Fantasy Sleepers & Busts":
         st.subheader("Fantasy Edge Map: Market Rank vs Model Rank")
         st.caption("Below the diagonal = your model ranks the player better than the market, which points to sleeper value. Above the diagonal = possible bust risk.")
 
-        fantasy_plot_df = fantasy_df[[
-            "fullName", "Team", "Primary Position", "Bats", "League", "Age", "Market Rank", "Model Rank", "Fantasy Edge",
-            "Current Production Score", "Projected Production Score", "ADP", "FantasyPros Rank", "Expert Std Dev",
+        fantasy_plot_cols = [
+            "fullName", "Player", "Team", "Primary Position", "Bats", "League", "Age",
+            "Market Rank", "Model Rank", "Fantasy Edge",
+            "Current Production Score", "Projected Production Score",
+            "ADP", "FantasyPros Rank", "Expert Std Dev",
             "Projected OPS", "Projected HR", "Projected RBI", "Projected SB"
-        ]].copy().rename(columns={"fullName": "Player"})
+        ]
+        available_fantasy_plot_cols = [col for col in fantasy_plot_cols if col in fantasy_df.columns]
+        fantasy_plot_df = fantasy_df[available_fantasy_plot_cols].copy()
+        if "fullName" in fantasy_plot_df.columns:
+            fantasy_plot_df = fantasy_plot_df.rename(columns={"fullName": "Player"})
+        if "Player" not in fantasy_plot_df.columns:
+            fantasy_plot_df["Player"] = "Unknown"
+
+        # Make sure optional visual columns exist so tooltips and dropdowns never crash.
+        for _col in ["Team", "Primary Position", "Bats", "League"]:
+            if _col not in fantasy_plot_df.columns:
+                fantasy_plot_df[_col] = "Unknown"
+        for _col in ["Age", "Fantasy Edge", "Current Production Score", "Projected Production Score", "ADP", "FantasyPros Rank", "Expert Std Dev", "Projected OPS", "Projected HR", "Projected RBI", "Projected SB"]:
+            if _col not in fantasy_plot_df.columns:
+                fantasy_plot_df[_col] = np.nan
 
         fantasy_color_col = st.selectbox(
             "Color by",
@@ -2451,33 +2487,46 @@ if active_page == "Fantasy Sleepers & Busts":
             index=1,
             key="fantasy_market_scatter_color"
         )
+        fantasy_size_options = [c for c in ["Fantasy Edge", "Projected Production Score", "Current Production Score", "Expert Std Dev", "None"] if c == "None" or c in fantasy_plot_df.columns]
         fantasy_size_col = st.selectbox(
             "Size by",
-            ["Fantasy Edge", "Projected Production Score", "Current Production Score", "Expert Std Dev", "None"],
+            fantasy_size_options,
             index=0,
             key="fantasy_market_scatter_size"
         )
 
-        base = alt.Chart(fantasy_plot_df.dropna(subset=["Market Rank", "Model Rank"])).mark_circle(
-            opacity=0.74, stroke="#333333", strokeWidth=0.45
-        )
-        enc = {
-            "x": alt.X("Market Rank:Q", title="Market Rank / ADP Rank", scale=alt.Scale(zero=False, reverse=True)),
-            "y": alt.Y("Model Rank:Q", title="Your Model Rank", scale=alt.Scale(zero=False, reverse=True)),
-            "tooltip": ["Player", "Team", "Primary Position", "Bats", "League", "Age", "Market Rank", "Model Rank", "Fantasy Edge", "ADP", "FantasyPros Rank", "Expert Std Dev", "Projected OPS", "Projected HR", "Projected RBI", "Projected SB"]
-        }
-        color_encoding = _scatter_color_encoding(fantasy_plot_df, fantasy_color_col)
-        if color_encoding is not None:
-            enc["color"] = color_encoding
-        if fantasy_size_col != "None" and fantasy_size_col in fantasy_plot_df.columns:
-            enc["size"] = alt.Size(f"{fantasy_size_col}:Q", title=fantasy_size_col, scale=alt.Scale(range=[25, 350], clamp=True))
+        required_plot_cols = ["Market Rank", "Model Rank"]
+        missing_plot_cols = [col for col in required_plot_cols if col not in fantasy_plot_df.columns]
+        if missing_plot_cols:
+            st.warning("Fantasy Edge Map cannot load yet because these columns are missing: " + ", ".join(missing_plot_cols))
         else:
-            base = base.mark_circle(size=85, opacity=0.74, stroke="#333333", strokeWidth=0.45)
-        points = base.encode(**enc)
-        max_rank = pd.to_numeric(fantasy_plot_df[["Market Rank", "Model Rank"]].stack(), errors="coerce").max()
-        diagonal_df = pd.DataFrame({"Market Rank": [1, max_rank], "Model Rank": [1, max_rank]})
-        diagonal = alt.Chart(diagonal_df).mark_line(color="#111111", strokeDash=[6, 4]).encode(x="Market Rank:Q", y="Model Rank:Q")
-        st.altair_chart((points + diagonal).interactive().properties(height=540), width="stretch")
+            chart_source = fantasy_plot_df.dropna(subset=["Market Rank", "Model Rank"]).copy()
+            if chart_source.empty:
+                st.info("No matched FantasyPros/ADP rows are available for the current filters. Try turning off the market match requirement or lowering minimum AB/G.")
+            else:
+                base = alt.Chart(chart_source).mark_circle(
+                    opacity=0.74, stroke="#333333", strokeWidth=0.45
+                )
+                tooltip_cols = [c for c in ["Player", "Team", "Primary Position", "Bats", "League", "Age", "Market Rank", "Model Rank", "Fantasy Edge", "ADP", "FantasyPros Rank", "Expert Std Dev", "Projected OPS", "Projected HR", "Projected RBI", "Projected SB"] if c in chart_source.columns]
+                enc = {
+                    "x": alt.X("Market Rank:Q", title="Market Rank / ADP Rank", scale=alt.Scale(zero=False, reverse=True)),
+                    "y": alt.Y("Model Rank:Q", title="Your Model Rank", scale=alt.Scale(zero=False, reverse=True)),
+                    "tooltip": tooltip_cols
+                }
+                color_encoding = _scatter_color_encoding(chart_source, fantasy_color_col)
+                if color_encoding is not None:
+                    enc["color"] = color_encoding
+                if fantasy_size_col != "None" and fantasy_size_col in chart_source.columns:
+                    enc["size"] = alt.Size(f"{fantasy_size_col}:Q", title=fantasy_size_col, scale=alt.Scale(range=[25, 350], clamp=True))
+                else:
+                    base = base.mark_circle(size=85, opacity=0.74, stroke="#333333", strokeWidth=0.45)
+                points = base.encode(**enc)
+                max_rank = pd.to_numeric(chart_source[["Market Rank", "Model Rank"]].stack(), errors="coerce").max()
+                if pd.isna(max_rank) or max_rank <= 1:
+                    max_rank = 300
+                diagonal_df = pd.DataFrame({"Market Rank": [1, max_rank], "Model Rank": [1, max_rank]})
+                diagonal = alt.Chart(diagonal_df).mark_line(color="#111111", strokeDash=[6, 4]).encode(x="Market Rank:Q", y="Model Rank:Q")
+                st.altair_chart((points + diagonal).interactive().properties(height=540), width="stretch")
 
         sleepers = fantasy_df.sort_values("Fantasy Edge", ascending=False).head(fantasy_top_n).copy()
         busts = fantasy_df.sort_values("Fantasy Edge", ascending=True).head(fantasy_top_n).copy()
