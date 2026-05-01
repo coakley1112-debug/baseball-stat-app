@@ -375,7 +375,7 @@ def format_display_table(df, count_cols=None, rate_cols=None, score_cols=None, c
 
 
 
-MAX_TABLE_DISPLAY_ROWS = 1000
+MAX_TABLE_DISPLAY_ROWS = 500
 
 @st.cache_data(show_spinner=False)
 def _df_to_csv_bytes(df):
@@ -391,8 +391,21 @@ def render_output_table(df, *, key, file_name, display_rows=MAX_TABLE_DISPLAY_RO
         display_df = table_df
 
     style_cols = [c for c in (style_cols or []) if c in display_df.columns]
-    if style_cols and display_df.size <= 250_000:
-        styled_df = display_df.style.map(color_trend, subset=style_cols)
+    # Avoid heavy styling on large tables. Styling was slowing Trend/Valuation pages and re-expanding decimals.
+    if style_cols and display_df.size <= 6000:
+        fmt = {}
+        for col in display_df.columns:
+            if col in TREND_RATE_COLS or col in ["OPS Δ", "BA Δ", "OBP Δ", "SLG Δ"]:
+                fmt[col] = "{:.4f}"
+            elif col in TREND_COUNT_COLS or col in ["HR Δ", "2B+3B Δ", "RBI Δ", "SB Δ", "R Δ", "H Δ", "2B Δ", "3B Δ", "BB Δ"]:
+                fmt[col] = "{:.1f}"
+            elif col in RATE_STATS or col in ["BA", "OBP", "SLG", "OPS"]:
+                fmt[col] = "{:.3f}"
+            elif col in ["Trend Score", "Current Score", "Performance Score", "Score"]:
+                fmt[col] = "{:.1f}"
+            elif col == "Valuation Score":
+                fmt[col] = "{:.4f}"
+        styled_df = display_df.style.map(color_trend, subset=style_cols).format(fmt)
         st.dataframe(styled_df, width="stretch", hide_index=True)
     else:
         st.dataframe(display_df, width="stretch", hide_index=True)
@@ -1184,7 +1197,7 @@ def train_random_forest_models(ml_training_df, feature_cols_tuple, target_stats_
         else:
             X_train, X_test, y_train, y_test = X_valid, X_valid, y_valid, y_valid
         model = RandomForestRegressor(
-            n_estimators=20,
+            n_estimators=12,
             max_depth=8,
             min_samples_leaf=10,
             max_features="sqrt",
@@ -2056,9 +2069,9 @@ if active_page == "Trend Value":
 
     trend_sorted = clean_ui_columns(trend_display.sort_values(sort_col, ascending=False))
     st.subheader("Trend Table")
-    st.caption("Showing the top 1,000 rows for speed. Use filters to narrow the table further.")
+    st.caption("Showing the top 500 rows for speed. Use filters to narrow the table further.")
     trend_sorted_display = format_display_table(
-        trend_sorted.head(1000),
+        trend_sorted.head(500),
         count_cols=[c for c in TREND_COUNT_COLS if c in trend_sorted.columns],
         rate_cols=[c for c in TREND_RATE_COLS if c in trend_sorted.columns],
         count_decimals=1,
@@ -2211,7 +2224,7 @@ if active_page == "ML Predictions":
         with c3:
             ml_sort_stat = st.selectbox("Rank Predictions By", ["OPS", "HR", "RBI", "SB", "R", "H", "BA", "OBP", "SLG", "BB"], index=0, key="ml_sort_stat")
         with c4top:
-            ml_max_players = st.selectbox("Projection Scope", [150, 300, 500, 750], index=1, key="ml_max_players", help="Lower numbers are much faster on Streamlit Cloud.")
+            ml_max_players = st.selectbox("Projection Scope", [100, 150, 300, 500], index=1, key="ml_max_players", help="Lower numbers are much faster on Streamlit Cloud.")
 
         st.subheader("Advanced Projection Settings")
         a1, a2, a3, a4 = st.columns(4)
