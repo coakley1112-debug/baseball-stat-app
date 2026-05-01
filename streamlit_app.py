@@ -265,6 +265,93 @@ def color_trend(val):
     except Exception:
         return ""
 
+
+def _extract_numeric_from_arrow(value):
+    """Convert values like '▲ 4.2' or '▼ -0.0310' back to numeric for styling."""
+    try:
+        if pd.isna(value):
+            return np.nan
+        if isinstance(value, str):
+            value = value.replace("▲", "").replace("▼", "").strip()
+        return float(value)
+    except Exception:
+        return np.nan
+
+
+def trend_heatmap_style(val):
+    """Heat-map style for Trend Table: green = improving, red = declining."""
+    v = _extract_numeric_from_arrow(val)
+    if pd.isna(v):
+        return ""
+    if v >= 5:
+        return "background-color:#006400; color:white; font-weight:bold;"
+    if v > 0:
+        return "background-color:#c6efce; color:#006100;"
+    if v <= -5:
+        return "background-color:#8b0000; color:white; font-weight:bold;"
+    if v < 0:
+        return "background-color:#ffc7ce; color:#9c0006;"
+    return ""
+
+
+def trend_heatmap_style_dynamic(val, col_name):
+    """Use tighter thresholds for rate stats like BA/OBP/SLG/OPS."""
+    v = _extract_numeric_from_arrow(val)
+    if pd.isna(v):
+        return ""
+    rate_cols = {"BA Δ", "OBP Δ", "SLG Δ", "OPS Δ"}
+    if col_name in rate_cols:
+        strong = 0.030
+    else:
+        strong = 5.0
+    if v >= strong:
+        return "background-color:#006400; color:white; font-weight:bold;"
+    if v > 0:
+        return "background-color:#c6efce; color:#006100;"
+    if v <= -strong:
+        return "background-color:#8b0000; color:white; font-weight:bold;"
+    if v < 0:
+        return "background-color:#ffc7ce; color:#9c0006;"
+    return ""
+
+
+def format_trend_arrow_value(x, is_rate=False):
+    """Format a trend value with an arrow and correct decimals."""
+    x = pd.to_numeric(x, errors="coerce")
+    if pd.isna(x):
+        return ""
+    arrow = "▲" if x > 0 else ("▼" if x < 0 else "")
+    if is_rate:
+        return f"{arrow} {x:.4f}".strip()
+    return f"{arrow} {x:.1f}".strip()
+
+
+def format_fantasy_table(df):
+    """Fantasy page display formatting. Ranks are integers, scores/rates are clean, counting projections use 1 decimal."""
+    df = df.copy()
+    rank_cols = ["Market Rank", "Model Rank", "Current Rank", "FantasyPros Rank", "ADP Rank", "RK", "BEST", "WORST"]
+    score_cols = ["Current Production Score", "Projected Production Score", "Sleeper Score", "Bust Risk Score"]
+    edge_cols = ["Fantasy Edge"]
+    rate_cols = ["BA", "OBP", "SLG", "OPS", "Projected BA", "Projected OBP", "Projected SLG", "Projected OPS"]
+    count_cols = ["R", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "Projected R", "Projected H", "Projected 2B", "Projected 3B", "Projected HR", "Projected RBI", "Projected SB", "Projected BB"]
+    one_decimal_cols = ["ADP", "Expert Std Dev", "Risk / Disagreement", "Age"]
+    for col in rank_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(0).astype("Int64")
+    for col in score_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(4)
+    for col in edge_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(1)
+    for col in rate_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(4)
+    for col in count_cols + one_decimal_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(1)
+    return df
+
 def classify_trend(row):
     ops_trend = pd.to_numeric(row.get("OPS_trend", np.nan), errors="coerce")
     hr_trend = pd.to_numeric(row.get("HR_trend", np.nan), errors="coerce")
@@ -2250,15 +2337,24 @@ if active_page == "Trend Value":
 
     trend_sorted = clean_ui_columns(trend_display.sort_values(sort_col, ascending=False))
     st.subheader("Trend Table")
-    st.caption("Showing the top 500 rows for speed. Use filters to narrow the table further.")
-    trend_sorted_display = format_display_table(
-        trend_sorted.head(500),
-        count_cols=[c for c in TREND_COUNT_COLS if c in trend_sorted.columns],
-        rate_cols=[c for c in TREND_RATE_COLS if c in trend_sorted.columns],
-        count_decimals=1,
-        rate_decimals=4,
+    st.caption("Showing the top 500 rows for speed. Use filters to narrow the table further. Green cells are improving trends; red cells are declining trends.")
+    trend_heat_cols = [c for c in TREND_COUNT_COLS + TREND_RATE_COLS if c in trend_sorted.columns]
+    trend_sorted_display = trend_sorted.head(500).copy()
+    for col in trend_heat_cols:
+        is_rate = col in TREND_RATE_COLS
+        trend_sorted_display[col] = trend_sorted_display[col].apply(lambda x, is_rate=is_rate: format_trend_arrow_value(x, is_rate=is_rate))
+    styled_trend = trend_sorted_display.style.apply(
+        lambda s: [trend_heatmap_style_dynamic(v, s.name) for v in s],
+        subset=trend_heat_cols
     )
-    render_output_table(trend_sorted_display, key="trend_table", file_name="trend_value.csv", style_cols=[c for c in trend_sorted_display.columns if "Δ" in c])
+    st.dataframe(styled_trend, width="stretch", hide_index=True)
+    st.download_button(
+        "Export CSV for Excel",
+        data=_df_to_csv_bytes(trend_sorted),
+        file_name="trend_value.csv",
+        mime="text/csv",
+        width="content",
+    )
     breakout_df = trend_value_df[["fullName", "bats", "OPS_trend", "HR_trend", "XBH_noHR_trend", "RBI_trend", "SB_trend"]].copy()
     top_breakouts = breakout_df.sort_values("OPS_trend", ascending=False).head(10)
     biggest_declines = breakout_df.sort_values("OPS_trend", ascending=True).head(10)
@@ -2365,7 +2461,14 @@ if active_page == "Fantasy Sleepers & Busts":
     fantasy_df = fantasy_df.merge(latest_context, on="playerID", how="left")
     fantasy_df["Team"] = fantasy_df.get("primaryHistoricalTeamName", "").fillna(fantasy_df.get("primaryTeamName", ""))
     fantasy_df["Primary Position"] = fantasy_df.get("careerPrimaryPos", fantasy_df.get("primaryPos", "DH")).fillna(fantasy_df.get("primaryPos", "DH")).fillna("DH")
-    fantasy_df["League"] = fantasy_df.get("primaryLeague", "Unknown").replace({"AL": "American League", "NL": "National League", "": "Unknown"}).fillna("Unknown")
+    fantasy_df["Primary Position"] = fantasy_df["Primary Position"].replace({"": "DH", "PH": "DH", "PR": "DH"}).fillna("DH")
+    fantasy_df["Bats"] = fantasy_df.get("bats", "Unknown").replace({"": "Unknown"}).fillna("Unknown")
+    if "primaryLeague" in fantasy_df.columns:
+        fantasy_df["League"] = fantasy_df["primaryLeague"].replace({"AL": "American League", "NL": "National League", "": "Unknown"}).fillna("Unknown")
+    elif "primaryTeamName" in fantasy_df.columns:
+        fantasy_df["League"] = fantasy_df["primaryTeamName"].apply(lambda x: "American League" if x in [team_id_to_name.get(t) for t in AL_TEAMS] else ("National League" if x in [team_id_to_name.get(t) for t in NL_TEAMS] else "Unknown"))
+    else:
+        fantasy_df["League"] = "Unknown"
 
     if fantasy_format == "5x5 Roto":
         # Roto rewards balanced category value: R, HR, RBI, SB, BA.
@@ -2426,7 +2529,12 @@ if active_page == "Fantasy Sleepers & Busts":
 
     f1, f2, f3, f4 = st.columns(4)
     with f1:
-        pos_options_fantasy = sorted([p for p in fantasy_df["Primary Position"].dropna().unique() if str(p).strip()])
+        standard_fantasy_positions = ["C", "1B", "2B", "3B", "SS", "OF", "DH", "P"]
+        existing_fantasy_positions = sorted([
+            p for p in fantasy_df["Primary Position"].dropna().astype(str).unique()
+            if p.strip() and p not in standard_fantasy_positions and p not in ["PH", "PR"]
+        ])
+        pos_options_fantasy = standard_fantasy_positions + existing_fantasy_positions
         fantasy_positions = st.multiselect("Primary Position", pos_options_fantasy, default=pos_options_fantasy, key="fantasy_market_positions")
     with f2:
         max_age_fantasy = int(pd.to_numeric(fantasy_df["Age"], errors="coerce").max()) if not fantasy_df.empty else 45
@@ -2480,6 +2588,7 @@ if active_page == "Fantasy Sleepers & Busts":
         for _col in ["Age", "Fantasy Edge", "Current Production Score", "Projected Production Score", "ADP", "FantasyPros Rank", "Expert Std Dev", "Projected OPS", "Projected HR", "Projected RBI", "Projected SB"]:
             if _col not in fantasy_plot_df.columns:
                 fantasy_plot_df[_col] = np.nan
+        fantasy_plot_df = format_fantasy_table(fantasy_plot_df)
 
         fantasy_color_col = st.selectbox(
             "Color by",
@@ -2539,10 +2648,8 @@ if active_page == "Fantasy Sleepers & Busts":
         ]
         sleepers_display = sleepers[[c for c in display_cols if c in sleepers.columns]].rename(columns={"fullName": "Player"})
         busts_display = busts[[c for c in display_cols if c in busts.columns]].rename(columns={"fullName": "Player"})
-        count_cols_f = ["Age", "ADP", "FantasyPros Rank", "Market Rank", "Model Rank", "Fantasy Edge", "Projected HR", "Projected RBI", "Projected SB"]
-        rate_cols_f = ["Current Production Score", "Projected Production Score", "Risk / Disagreement", "Projected OPS"]
-        sleepers_display = format_display_table(clean_ui_columns(sleepers_display), count_cols=count_cols_f, rate_cols=rate_cols_f, count_decimals=1, rate_decimals=3)
-        busts_display = format_display_table(clean_ui_columns(busts_display), count_cols=count_cols_f, rate_cols=rate_cols_f, count_decimals=1, rate_decimals=3)
+        sleepers_display = format_fantasy_table(clean_ui_columns(sleepers_display))
+        busts_display = format_fantasy_table(clean_ui_columns(busts_display))
 
         c8, c9 = st.columns(2)
         with c8:
@@ -2555,14 +2662,14 @@ if active_page == "Fantasy Sleepers & Busts":
         st.subheader("Fantasy Market Insight Summary")
         st.success(
             f"Top sleeper: {top_sleeper['fullName']} has a Fantasy Edge of {fmt_count_1(top_sleeper['Fantasy Edge'])}. "
-            f"Market Rank is {fmt_count_1(top_sleeper['Market Rank'])}, while your Model Rank is {fmt_count_1(top_sleeper['Model Rank'])}. "
-            f"Projected line: {fmt_rate_3(top_sleeper['Projected OPS'])} OPS, {fmt_count_1(top_sleeper['Projected HR'])} HR, "
+            f"Market Rank is {fmt_int(top_sleeper['Market Rank'])}, while your Model Rank is {fmt_int(top_sleeper['Model Rank'])}. "
+            f"Projected line: {fmt_rate_4(top_sleeper['Projected OPS'])} OPS, {fmt_count_1(top_sleeper['Projected HR'])} HR, "
             f"{fmt_count_1(top_sleeper['Projected RBI'])} RBI, {fmt_count_1(top_sleeper['Projected SB'])} SB."
         )
         st.warning(
             f"Top bust risk: {top_bust['fullName']} has a Fantasy Edge of {fmt_count_1(top_bust['Fantasy Edge'])}. "
-            f"Market Rank is {fmt_count_1(top_bust['Market Rank'])}, while your Model Rank is {fmt_count_1(top_bust['Model Rank'])}. "
-            f"Projected line: {fmt_rate_3(top_bust['Projected OPS'])} OPS, {fmt_count_1(top_bust['Projected HR'])} HR, "
+            f"Market Rank is {fmt_int(top_bust['Market Rank'])}, while your Model Rank is {fmt_int(top_bust['Model Rank'])}. "
+            f"Projected line: {fmt_rate_4(top_bust['Projected OPS'])} OPS, {fmt_count_1(top_bust['Projected HR'])} HR, "
             f"{fmt_count_1(top_bust['Projected RBI'])} RBI, {fmt_count_1(top_bust['Projected SB'])} SB."
         )
 
