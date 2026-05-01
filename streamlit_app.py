@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 import altair as alt
 from matplotlib.ticker import MaxNLocator
 from pathlib import Path
+import re
+import unicodedata
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -1002,6 +1004,165 @@ def clean_ui_columns(df):
     return df.drop(columns=drop_cols, errors="ignore")
 
 
+
+
+# ----------------------------
+# FantasyPros / market-data helpers
+# ----------------------------
+def normalize_player_name_for_merge(name):
+    """Normalize player names so Lahman/app names can match FantasyPros names."""
+    if pd.isna(name):
+        return ""
+    text = str(name)
+    text = text.replace("(Batter)", "").replace("(Pitcher)", "")
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^A-Za-z0-9 ]+", " ", text)
+    text = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text
+
+
+def read_optional_csv(filename):
+    """Read an optional CSV from the same app folder. Return empty df if missing."""
+    path = BASE_DIR / filename
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path, low_memory=False, dtype=str)
+    except Exception:
+        try:
+            return pd.read_csv(path, low_memory=False, dtype=str, engine="python")
+        except Exception:
+            return pd.DataFrame()
+
+
+def first_existing_col(df, names):
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+
+def to_numeric_safe_series(s):
+    return pd.to_numeric(s.astype(str).str.replace("-", "", regex=False).str.replace(",", "", regex=False), errors="coerce")
+
+
+@st.cache_data(show_spinner=False)
+def load_fantasypros_market_data():
+    """Load FantasyPros expert rankings and ADP if the CSVs are in the app folder.
+
+    Expected optional files:
+    - FantasyPros_2026_Draft_H_Rankings.csv
+    - FantasyPros_2026_Hitter_MLB_ADP_Rankings.csv
+
+    The ADP export can have awkward headers, so this function detects the useful columns.
+    """
+    rank_file = "FantasyPros_2026_Draft_H_Rankings.csv"
+    adp_file = "FantasyPros_2026_Hitter_MLB_ADP_Rankings.csv"
+
+    rankings = read_optional_csv(rank_file)
+    adp = read_optional_csv(adp_file)
+    pieces = []
+
+    if not rankings.empty:
+        r = rankings.copy()
+        player_col = first_existing_col(r, ["PLAYER NAME", "Player", "PLAYER", "Name"])
+        if player_col:
+            out = pd.DataFrame()
+            out["Player"] = r[player_col].astype(str).str.strip()
+            out["Player Key"] = out["Player"].apply(normalize_player_name_for_merge)
+            out["FantasyPros Rank"] = to_numeric_safe_series(r[first_existing_col(r, ["RK", "Rank", "ECR"])] if first_existing_col(r, ["RK", "Rank", "ECR"]) else pd.Series(np.nan, index=r.index))
+            out["Expert Avg Rank"] = to_numeric_safe_series(r[first_existing_col(r, ["AVG.", "AVG", "Average"])] if first_existing_col(r, ["AVG.", "AVG", "Average"]) else pd.Series(np.nan, index=r.index))
+            out["Expert Std Dev"] = to_numeric_safe_series(r[first_existing_col(r, ["STD.DEV", "STD DEV", "Std Dev"])] if first_existing_col(r, ["STD.DEV", "STD DEV", "Std Dev"]) else pd.Series(np.nan, index=r.index))
+            out["ECR vs ADP"] = r[first_existing_col(r, ["ECR VS ADP", "ECR vs ADP"])] if first_existing_col(r, ["ECR VS ADP", "ECR vs ADP"]) else np.nan
+            out["FantasyPros Team"] = r[first_existing_col(r, ["TEAM", "Team"])] if first_existing_col(r, ["TEAM", "Team"]) else ""
+            out["FantasyPros Position"] = r[first_existing_col(r, ["POS", "Positions", "Position"])] if first_existing_col(r, ["POS", "Positions", "Position"]) else ""
+            out = out[out["Player Key"] != ""]
+            pieces.append(out)
+
+    if not adp.empty:
+        a = adp.copy()
+        # Normal clean export: Player column is actually player names.
+        player_col = first_existing_col(a, ["Player", "PLAYER NAME", "PLAYER", "Name"])
+        # The uploaded FantasyPros ADP file appears to put player names in the first "Positions" column.
+        # If the Player column looks like positions (many comma-separated position strings), switch to Positions.
+        if player_col and player_col in a.columns:
+            sample = a[player_col].dropna().astype(str).head(20).str.contains(r"^(C|1B|2B|3B|SS|OF|LF|CF|RF|DH|SP|RP)(,|$)", regex=True).mean()
+            if sample > 0.4 and "Positions" in a.columns:
+                player_col = "Positions"
+        elif "Positions" in a.columns:
+            player_col = "Positions"
+
+        if player_col:
+            out = pd.DataFrame()
+            out["Player"] = a[player_col].astype(str).str.strip()
+            out["Player Key"] = out["Player"].apply(normalize_player_name_for_merge)
+            # Prefer AVG if populated; otherwise use the first rank column, which is often hitter ADP rank.
+            avg_col = first_existing_col(a, ["AVG", "AVG.", "Average"])
+            hitter_rank_col = first_existing_col(a, ["Hitters", "Hitter", "Rank"])
+            if avg_col and to_numeric_safe_series(a[avg_col]).notna().sum() > 5:
+                out["ADP"] = to_numeric_safe_series(a[avg_col])
+            elif hitter_rank_col:
+                out["ADP"] = to_numeric_safe_series(a[hitter_rank_col])
+            else:
+                out["ADP"] = np.nan
+            out["ADP Rank"] = out["ADP"].rank(method="min", ascending=True)
+            # Best-effort team/position fields from messy export.
+            team_candidate = first_existing_col(a, ["Overall", "TEAM", "Team"])
+            out["ADP Team"] = a[team_candidate] if team_candidate else ""
+            pos_candidate = first_existing_col(a, ["Player", "POS", "Positions"])
+            out["ADP Position"] = a[pos_candidate] if pos_candidate and pos_candidate != player_col else ""
+            out = out[out["Player Key"] != ""]
+            pieces.append(out)
+
+    if not pieces:
+        return pd.DataFrame()
+
+    market = pieces[0]
+    for piece in pieces[1:]:
+        market = market.merge(piece.drop(columns=["Player"], errors="ignore"), on="Player Key", how="outer", suffixes=("", "_adp"))
+    if "Player" not in market.columns:
+        market["Player"] = market["Player Key"]
+    # Consolidate duplicate columns from the outer merge.
+    for col in ["FantasyPros Rank", "Expert Avg Rank", "Expert Std Dev", "ADP", "ADP Rank"]:
+        dup = f"{col}_adp"
+        if dup in market.columns:
+            market[col] = pd.to_numeric(market.get(col), errors="coerce").fillna(pd.to_numeric(market[dup], errors="coerce"))
+            market = market.drop(columns=[dup])
+    market["Market Rank"] = pd.to_numeric(market.get("ADP Rank"), errors="coerce")
+    market["Market Rank"] = market["Market Rank"].fillna(pd.to_numeric(market.get("FantasyPros Rank"), errors="coerce"))
+    market = market.sort_values("Market Rank", na_position="last").drop_duplicates("Player Key", keep="first")
+    return market
+
+
+def normalize_score(series):
+    s = pd.to_numeric(series, errors="coerce")
+    mn, mx = s.min(), s.max()
+    if pd.isna(mn) or pd.isna(mx) or mx == mn:
+        return pd.Series(0.5, index=s.index)
+    return (s - mn) / (mx - mn)
+
+
+def make_fantasy_market_reason(row, kind="sleeper"):
+    edge = pd.to_numeric(row.get("Fantasy Edge", np.nan), errors="coerce")
+    adp = pd.to_numeric(row.get("ADP", np.nan), errors="coerce")
+    model_rank = pd.to_numeric(row.get("Model Rank", np.nan), errors="coerce")
+    trend = pd.to_numeric(row.get("Projected Production Score", np.nan), errors="coerce")
+    if kind == "sleeper":
+        parts = []
+        if pd.notna(edge) and edge >= 20:
+            parts.append("model rank is much better than market rank")
+        if pd.notna(adp):
+            parts.append("draft cost appears lower than projected value")
+        if pd.notna(trend) and trend >= 0.65:
+            parts.append("strong projected production profile")
+        return ", ".join(parts) if parts else "model likes him more than the market"
+    parts = []
+    if pd.notna(edge) and edge <= -20:
+        parts.append("market rank is much better than model rank")
+    if pd.notna(model_rank):
+        parts.append("projection does not justify current draft cost")
+    return ", ".join(parts) if parts else "market appears higher than internal model"
 
 def baseball_age_for_season(season_year, birth_year, birth_month=np.nan, birth_day=np.nan):
     """Approximate MLB season age using July 1 of the season, not simply season_year - birth_year.
@@ -2125,21 +2286,29 @@ if active_page == "Trend Value":
     if not player_summary_row.empty:
         st.info(make_trend_insight_summary(player_summary_row.iloc[0]))
 
+
 if active_page == "Fantasy Sleepers & Busts":
     render_section_header(
         "🧠 Fantasy Sleepers & Busts",
-        "Find fantasy sleeper candidates and bust risks using current production, recent trends, and next-season trend estimates."
+        "Compare your internal projection model against FantasyPros rankings and ADP to find market sleepers and bust risks."
     )
+
+    market_df = load_fantasypros_market_data()
+    if market_df.empty:
+        st.warning(
+            "FantasyPros files were not found. Upload FantasyPros_2026_Draft_H_Rankings.csv and "
+            "FantasyPros_2026_Hitter_MLB_ADP_Rankings.csv to the same folder/repository as streamlit_app.py."
+        )
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        fantasy_window = st.selectbox("Fantasy Window (Years)", [3, 4, 5], index=0, key="fantasy_window")
+        fantasy_window = st.selectbox("Projection Window (Years)", [3, 4, 5], index=0, key="fantasy_market_window")
     with c2:
-        fantasy_format = st.selectbox("Fantasy Format", ["5x5 Roto", "Points League"], index=0, key="fantasy_format")
+        fantasy_format = st.selectbox("Fantasy Format", ["5x5 Roto", "Points League"], index=0, key="fantasy_market_format")
     with c3:
-        fantasy_min_g = st.number_input("Minimum Games", 0, 800, 50, key="fantasy_min_g")
+        fantasy_min_g = st.number_input("Minimum Games", 0, 800, 50, key="fantasy_market_min_g")
     with c4:
-        fantasy_min_ab = st.number_input("Minimum AB", 0, 2500, 150, key="fantasy_min_ab")
+        fantasy_min_ab = st.number_input("Minimum AB", 0, 2500, 150, key="fantasy_market_min_ab")
 
     max_year_fantasy = int(yearly_df["yearID"].max())
     fantasy_years = list(range(max_year_fantasy - fantasy_window + 1, max_year_fantasy + 1))
@@ -2167,161 +2336,183 @@ if active_page == "Fantasy Sleepers & Busts":
     fantasy_df = agg_fantasy.merge(fantasy_trends, on="playerID", how="left")
     fantasy_df = add_latest_and_projection_columns(fantasy_df, recent_fantasy)
 
-    latest_context = recent_fantasy.sort_values(["playerID", "yearID"]).groupby("playerID").tail(1)[[
-        "playerID", "primaryHistoricalTeamName", "primaryTeamName", "careerPrimaryPos", "primaryPos", "yearID", "birthYear", "birthMonth", "birthDay"
-    ]].copy()
+    latest_cols = ["playerID", "primaryHistoricalTeamName", "primaryTeamName", "primaryLeague", "careerPrimaryPos", "primaryPos", "yearID", "birthYear", "birthMonth", "birthDay"]
+    latest_context = recent_fantasy.sort_values(["playerID", "yearID"]).groupby("playerID").tail(1)[[c for c in latest_cols if c in recent_fantasy.columns]].copy()
     latest_context["Age"] = latest_context.apply(
         lambda r: baseball_age_for_season(r.get("yearID"), r.get("birthYear"), r.get("birthMonth", np.nan), r.get("birthDay", np.nan)),
         axis=1
     )
     fantasy_df = fantasy_df.merge(latest_context, on="playerID", how="left")
-    fantasy_df["Team"] = fantasy_df["primaryHistoricalTeamName"].fillna(fantasy_df.get("primaryTeamName", ""))
-    fantasy_df["Position"] = fantasy_df["careerPrimaryPos"].fillna(fantasy_df.get("primaryPos", "DH")).fillna("DH")
-
-    def _fantasy_norm(s):
-        s = pd.to_numeric(s, errors="coerce")
-        mn, mx = s.min(), s.max()
-        if pd.isna(mn) or pd.isna(mx) or mx == mn:
-            return pd.Series(0.5, index=s.index)
-        return (s - mn) / (mx - mn)
+    fantasy_df["Team"] = fantasy_df.get("primaryHistoricalTeamName", "").fillna(fantasy_df.get("primaryTeamName", ""))
+    fantasy_df["Primary Position"] = fantasy_df.get("careerPrimaryPos", fantasy_df.get("primaryPos", "DH")).fillna(fantasy_df.get("primaryPos", "DH")).fillna("DH")
+    fantasy_df["League"] = fantasy_df.get("primaryLeague", "Unknown").replace({"AL": "American League", "NL": "National League", "": "Unknown"}).fillna("Unknown")
 
     if fantasy_format == "5x5 Roto":
-        fantasy_df["Current Score"] = (
-            _fantasy_norm(fantasy_df["R"]) + _fantasy_norm(fantasy_df["HR"]) + _fantasy_norm(fantasy_df["RBI"]) +
-            _fantasy_norm(fantasy_df["SB"]) + _fantasy_norm(fantasy_df["BA"])
+        # Roto rewards balanced category value: R, HR, RBI, SB, BA.
+        fantasy_df["Current Production Score"] = (
+            normalize_score(fantasy_df["R"]) + normalize_score(fantasy_df["HR"]) + normalize_score(fantasy_df["RBI"]) +
+            normalize_score(fantasy_df["SB"]) + normalize_score(fantasy_df["BA"])
         ) / 5
-        fantasy_df["Future Score"] = (
-            _fantasy_norm(fantasy_df["proj_R"]) + _fantasy_norm(fantasy_df["proj_HR"]) + _fantasy_norm(fantasy_df["proj_RBI"]) +
-            _fantasy_norm(fantasy_df["proj_SB"]) + _fantasy_norm(fantasy_df["proj_BA"])
+        fantasy_df["Projected Production Score"] = (
+            normalize_score(fantasy_df["proj_R"]) + normalize_score(fantasy_df["proj_HR"]) + normalize_score(fantasy_df["proj_RBI"]) +
+            normalize_score(fantasy_df["proj_SB"]) + normalize_score(fantasy_df["proj_BA"])
         ) / 5
     else:
+        with st.expander("Points League Scoring Settings"):
+            p1, p2, p3, p4, p5 = st.columns(5)
+            with p1: pts_r = st.number_input("Run", value=1.0, step=0.5, key="fantasy_pts_r")
+            with p2: pts_rbi = st.number_input("RBI", value=1.0, step=0.5, key="fantasy_pts_rbi")
+            with p3: pts_hr = st.number_input("HR", value=4.0, step=0.5, key="fantasy_pts_hr")
+            with p4: pts_sb = st.number_input("SB", value=2.0, step=0.5, key="fantasy_pts_sb")
+            with p5: pts_bb = st.number_input("BB", value=1.0, step=0.5, key="fantasy_pts_bb")
+            p6, p7, p8 = st.columns(3)
+            with p6: pts_h = st.number_input("Hit", value=1.0, step=0.5, key="fantasy_pts_h")
+            with p7: pts_2b3b = st.number_input("2B+3B Bonus", value=1.0, step=0.5, key="fantasy_pts_xbh")
+            with p8: pts_ab_penalty = st.number_input("AB Penalty", value=0.0, step=0.1, key="fantasy_pts_ab_penalty")
         fantasy_df["Current Points Proxy"] = (
-            fantasy_df["R"] + fantasy_df["RBI"] + fantasy_df["BB"] + fantasy_df["SB"] * 2 +
-            fantasy_df["H"] + fantasy_df["2B"] + 2 * fantasy_df["3B"] + 3 * fantasy_df["HR"]
+            fantasy_df["R"] * pts_r + fantasy_df["RBI"] * pts_rbi + fantasy_df["HR"] * pts_hr +
+            fantasy_df["SB"] * pts_sb + fantasy_df["BB"] * pts_bb + fantasy_df["H"] * pts_h +
+            (fantasy_df["2B"] + fantasy_df["3B"]) * pts_2b3b - fantasy_df["AB"] * pts_ab_penalty
         )
-        fantasy_df["Future Points Proxy"] = (
-            fantasy_df["proj_R"] + fantasy_df["proj_RBI"] + fantasy_df["proj_BB"] + fantasy_df["proj_SB"] * 2 +
-            fantasy_df["proj_H"] + fantasy_df["proj_XBH"] + 3 * fantasy_df["proj_HR"]
+        fantasy_df["Projected Points Proxy"] = (
+            fantasy_df["proj_R"] * pts_r + fantasy_df["proj_RBI"] * pts_rbi + fantasy_df["proj_HR"] * pts_hr +
+            fantasy_df["proj_SB"] * pts_sb + fantasy_df["proj_BB"] * pts_bb + fantasy_df["proj_H"] * pts_h +
+            fantasy_df["proj_XBH"] * pts_2b3b - fantasy_df["latest_AB" if "latest_AB" in fantasy_df.columns else "AB"] * pts_ab_penalty
         )
-        fantasy_df["Current Score"] = _fantasy_norm(fantasy_df["Current Points Proxy"])
-        fantasy_df["Future Score"] = _fantasy_norm(fantasy_df["Future Points Proxy"])
+        fantasy_df["Current Production Score"] = normalize_score(fantasy_df["Current Points Proxy"])
+        fantasy_df["Projected Production Score"] = normalize_score(fantasy_df["Projected Points Proxy"])
 
-    fantasy_df["Trend Score"] = (
-        fantasy_df["R_trend"].fillna(0) * 1.0 + fantasy_df["HR_trend"].fillna(0) * 2.0 +
-        fantasy_df["RBI_trend"].fillna(0) * 1.5 + fantasy_df["SB_trend"].fillna(0) * 1.25 +
-        fantasy_df["OBP_trend"].fillna(0) * 100 + fantasy_df["SLG_trend"].fillna(0) * 100 +
-        fantasy_df["OPS_trend"].fillna(0) * 100
-    )
-    fantasy_df["Trend Normalized"] = _fantasy_norm(fantasy_df["Trend Score"])
-    fantasy_df["Future Normalized"] = _fantasy_norm(fantasy_df["Future Score"])
-    fantasy_df["Current Normalized"] = _fantasy_norm(fantasy_df["Current Score"])
+    fantasy_df["Model Rank"] = fantasy_df["Projected Production Score"].rank(method="min", ascending=False)
+    fantasy_df["Current Rank"] = fantasy_df["Current Production Score"].rank(method="min", ascending=False)
+    fantasy_df["Player Key"] = fantasy_df["fullName"].apply(normalize_player_name_for_merge)
 
-    fantasy_df["Sleeper Score"] = _fantasy_norm(
-        0.50 * fantasy_df["Future Normalized"] +
-        0.35 * fantasy_df["Trend Normalized"] -
-        0.20 * fantasy_df["Current Normalized"]
-    )
-    fantasy_df["Bust Risk Score"] = _fantasy_norm(
-        0.55 * fantasy_df["Current Normalized"] -
-        0.30 * fantasy_df["Trend Normalized"] -
-        0.25 * fantasy_df["Future Normalized"]
-    )
+    if not market_df.empty:
+        fantasy_df = fantasy_df.merge(
+            market_df[[c for c in ["Player Key", "ADP", "ADP Rank", "FantasyPros Rank", "Expert Avg Rank", "Expert Std Dev", "Market Rank"] if c in market_df.columns]],
+            on="Player Key",
+            how="left"
+        )
+    else:
+        for c in ["ADP", "ADP Rank", "FantasyPros Rank", "Expert Avg Rank", "Expert Std Dev", "Market Rank"]:
+            fantasy_df[c] = np.nan
 
+    fantasy_df["Market Rank"] = pd.to_numeric(fantasy_df["Market Rank"], errors="coerce")
+    fantasy_df["Fantasy Edge"] = fantasy_df["Market Rank"] - fantasy_df["Model Rank"]
     fantasy_df["Projected OPS"] = fantasy_df["proj_OPS"]
     fantasy_df["Projected HR"] = fantasy_df["proj_HR"]
     fantasy_df["Projected RBI"] = fantasy_df["proj_RBI"]
     fantasy_df["Projected SB"] = fantasy_df["proj_SB"]
+    fantasy_df["Risk / Disagreement"] = pd.to_numeric(fantasy_df.get("Expert Std Dev"), errors="coerce")
 
-    def sleeper_reason(row):
-        parts = []
-        if pd.to_numeric(row.get("Trend Normalized"), errors="coerce") >= 0.70:
-            parts.append("strong recent trend")
-        if pd.to_numeric(row.get("Future Normalized"), errors="coerce") >= 0.70:
-            parts.append("strong future estimate")
-        if pd.to_numeric(row.get("Current Normalized"), errors="coerce") <= 0.65:
-            parts.append("not already obvious by current score")
-        return ", ".join(parts) if parts else "balanced upside profile"
-
-    def bust_reason(row):
-        parts = []
-        if pd.to_numeric(row.get("Current Normalized"), errors="coerce") >= 0.70:
-            parts.append("high current production")
-        if pd.to_numeric(row.get("Trend Normalized"), errors="coerce") <= 0.40:
-            parts.append("weak or declining trend")
-        if pd.to_numeric(row.get("Future Normalized"), errors="coerce") <= 0.50:
-            parts.append("future estimate is not as strong as current value")
-        return ", ".join(parts) if parts else "possible regression-risk profile"
-
-    fantasy_df["Sleeper Reason"] = fantasy_df.apply(sleeper_reason, axis=1)
-    fantasy_df["Bust Reason"] = fantasy_df.apply(bust_reason, axis=1)
-
-    f1, f2, f3 = st.columns(3)
+    f1, f2, f3, f4 = st.columns(4)
     with f1:
-        pos_options_fantasy = sorted([p for p in fantasy_df["Position"].dropna().unique() if str(p).strip()])
-        fantasy_positions = st.multiselect("Position", pos_options_fantasy, default=pos_options_fantasy, key="fantasy_positions")
+        pos_options_fantasy = sorted([p for p in fantasy_df["Primary Position"].dropna().unique() if str(p).strip()])
+        fantasy_positions = st.multiselect("Primary Position", pos_options_fantasy, default=pos_options_fantasy, key="fantasy_market_positions")
     with f2:
         max_age_fantasy = int(pd.to_numeric(fantasy_df["Age"], errors="coerce").max()) if not fantasy_df.empty else 45
-        fantasy_age_range = st.slider("Age Range", 18, max(45, max_age_fantasy), (18, max(45, max_age_fantasy)), key="fantasy_age_range")
+        fantasy_age_range = st.slider("Age Range", 18, max(45, max_age_fantasy), (18, max(45, max_age_fantasy)), key="fantasy_market_age_range")
     with f3:
-        fantasy_top_n = st.slider("Show Top N", 5, 50, 15, key="fantasy_top_n")
+        require_market_match = st.checkbox("Require FantasyPros/ADP Match", value=True, key="fantasy_require_market_match")
+    with f4:
+        fantasy_top_n = st.slider("Show Top N", 5, 50, 15, key="fantasy_market_top_n")
 
     if fantasy_positions:
-        fantasy_df = fantasy_df[fantasy_df["Position"].isin(fantasy_positions)].copy()
+        fantasy_df = fantasy_df[fantasy_df["Primary Position"].isin(fantasy_positions)].copy()
     fantasy_df = fantasy_df[
         (pd.to_numeric(fantasy_df["Age"], errors="coerce") >= fantasy_age_range[0]) &
         (pd.to_numeric(fantasy_df["Age"], errors="coerce") <= fantasy_age_range[1])
     ].copy()
+    if require_market_match:
+        fantasy_df = fantasy_df[fantasy_df["Market Rank"].notna()].copy()
 
     if fantasy_df.empty:
-        st.warning("No players met the fantasy filters. Try lowering minimum AB/G or expanding age/position filters.")
+        st.warning("No players met the fantasy filters. Try lowering minimum AB/G, expanding age/position filters, or turning off the FantasyPros/ADP match requirement.")
     else:
-        top_sleeper = fantasy_df.sort_values("Sleeper Score", ascending=False).iloc[0]
-        top_bust = fantasy_df.sort_values("Bust Risk Score", ascending=False).iloc[0]
-        c5, c6, c7 = st.columns(3)
-        c5.metric("Top Sleeper", str(top_sleeper["fullName"]))
-        c6.metric("Top Bust Risk", str(top_bust["fullName"]))
-        c7.metric("Average Future Score", fmt_rate_4(fantasy_df["Future Score"].mean()))
+        top_sleeper = fantasy_df.sort_values("Fantasy Edge", ascending=False).iloc[0]
+        top_bust = fantasy_df.sort_values("Fantasy Edge", ascending=True).iloc[0]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Top Sleeper", str(top_sleeper["fullName"]))
+        m2.metric("Top Bust Risk", str(top_bust["fullName"]))
+        m3.metric("Matched Players", f"{fantasy_df['Market Rank'].notna().sum():,.0f}")
+        m4.metric("Avg Fantasy Edge", fmt_count_1(fantasy_df["Fantasy Edge"].mean()))
 
-        st.subheader("Fantasy Value Map")
-        st.caption("Upper-left players tend to be sleepers. Lower-right players tend to be bust risks.")
-        chart_df = fantasy_df[["fullName", "Team", "Position", "Age", "Current Score", "Future Score", "Sleeper Score", "Bust Risk Score", "Projected OPS", "Projected HR", "Projected RBI", "Projected SB"]].copy().rename(columns={"fullName": "Player"})
-        chart = alt.Chart(chart_df).mark_circle(opacity=0.72, stroke="#333333", strokeWidth=0.4).encode(
-            x=alt.X("Current Score:Q", title="Current Score", scale=alt.Scale(zero=False)),
-            y=alt.Y("Future Score:Q", title="Future Score", scale=alt.Scale(zero=False)),
-            size=alt.Size("Sleeper Score:Q", scale=alt.Scale(range=[20, 350]), title="Sleeper Score"),
-            color=alt.Color("Position:N", title="Position"),
-            tooltip=["Player", "Team", "Position", "Age", "Current Score", "Future Score", "Sleeper Score", "Bust Risk Score", "Projected OPS", "Projected HR", "Projected RBI", "Projected SB"]
-        ).interactive().properties(height=520)
-        st.altair_chart(chart, width="stretch")
+        st.subheader("Fantasy Edge Map: Market Rank vs Model Rank")
+        st.caption("Below the diagonal = your model ranks the player better than the market, which points to sleeper value. Above the diagonal = possible bust risk.")
 
-        sleeper_display = fantasy_df.sort_values("Sleeper Score", ascending=False).head(fantasy_top_n)[[
-            "fullName", "Team", "Position", "Age", "Current Score", "Future Score", "Trend Score", "Sleeper Score",
-            "Projected OPS", "Projected HR", "Projected RBI", "Projected SB", "Sleeper Reason"
-        ]].rename(columns={"fullName": "Player"})
-        sleeper_display = format_display_table(clean_ui_columns(sleeper_display), count_cols=["Age", "Projected HR", "Projected RBI", "Projected SB"], rate_cols=["Current Score", "Future Score", "Sleeper Score", "Projected OPS"], score_cols=["Trend Score"])
+        fantasy_plot_df = fantasy_df[[
+            "fullName", "Team", "Primary Position", "Bats", "League", "Age", "Market Rank", "Model Rank", "Fantasy Edge",
+            "Current Production Score", "Projected Production Score", "ADP", "FantasyPros Rank", "Expert Std Dev",
+            "Projected OPS", "Projected HR", "Projected RBI", "Projected SB"
+        ]].copy().rename(columns={"fullName": "Player"})
 
-        bust_display = fantasy_df.sort_values("Bust Risk Score", ascending=False).head(fantasy_top_n)[[
-            "fullName", "Team", "Position", "Age", "Current Score", "Future Score", "Trend Score", "Bust Risk Score",
-            "Projected OPS", "Projected HR", "Projected RBI", "Projected SB", "Bust Reason"
-        ]].rename(columns={"fullName": "Player"})
-        bust_display = format_display_table(clean_ui_columns(bust_display), count_cols=["Age", "Projected HR", "Projected RBI", "Projected SB"], rate_cols=["Current Score", "Future Score", "Bust Risk Score", "Projected OPS"], score_cols=["Trend Score"])
+        fantasy_color_col = st.selectbox(
+            "Color by",
+            ["None", "Primary Position", "Bats", "Team", "League"],
+            index=1,
+            key="fantasy_market_scatter_color"
+        )
+        fantasy_size_col = st.selectbox(
+            "Size by",
+            ["Fantasy Edge", "Projected Production Score", "Current Production Score", "Expert Std Dev", "None"],
+            index=0,
+            key="fantasy_market_scatter_size"
+        )
+
+        base = alt.Chart(fantasy_plot_df.dropna(subset=["Market Rank", "Model Rank"])).mark_circle(
+            opacity=0.74, stroke="#333333", strokeWidth=0.45
+        )
+        enc = {
+            "x": alt.X("Market Rank:Q", title="Market Rank / ADP Rank", scale=alt.Scale(zero=False, reverse=True)),
+            "y": alt.Y("Model Rank:Q", title="Your Model Rank", scale=alt.Scale(zero=False, reverse=True)),
+            "tooltip": ["Player", "Team", "Primary Position", "Bats", "League", "Age", "Market Rank", "Model Rank", "Fantasy Edge", "ADP", "FantasyPros Rank", "Expert Std Dev", "Projected OPS", "Projected HR", "Projected RBI", "Projected SB"]
+        }
+        color_encoding = _scatter_color_encoding(fantasy_plot_df, fantasy_color_col)
+        if color_encoding is not None:
+            enc["color"] = color_encoding
+        if fantasy_size_col != "None" and fantasy_size_col in fantasy_plot_df.columns:
+            enc["size"] = alt.Size(f"{fantasy_size_col}:Q", title=fantasy_size_col, scale=alt.Scale(range=[25, 350], clamp=True))
+        else:
+            base = base.mark_circle(size=85, opacity=0.74, stroke="#333333", strokeWidth=0.45)
+        points = base.encode(**enc)
+        max_rank = pd.to_numeric(fantasy_plot_df[["Market Rank", "Model Rank"]].stack(), errors="coerce").max()
+        diagonal_df = pd.DataFrame({"Market Rank": [1, max_rank], "Model Rank": [1, max_rank]})
+        diagonal = alt.Chart(diagonal_df).mark_line(color="#111111", strokeDash=[6, 4]).encode(x="Market Rank:Q", y="Model Rank:Q")
+        st.altair_chart((points + diagonal).interactive().properties(height=540), width="stretch")
+
+        sleepers = fantasy_df.sort_values("Fantasy Edge", ascending=False).head(fantasy_top_n).copy()
+        busts = fantasy_df.sort_values("Fantasy Edge", ascending=True).head(fantasy_top_n).copy()
+        sleepers["Reason"] = sleepers.apply(lambda r: make_fantasy_market_reason(r, "sleeper"), axis=1)
+        busts["Reason"] = busts.apply(lambda r: make_fantasy_market_reason(r, "bust"), axis=1)
+
+        display_cols = [
+            "fullName", "Team", "Primary Position", "Age", "ADP", "FantasyPros Rank", "Market Rank", "Model Rank", "Fantasy Edge",
+            "Current Production Score", "Projected Production Score", "Risk / Disagreement", "Projected OPS", "Projected HR", "Projected RBI", "Projected SB", "Reason"
+        ]
+        sleepers_display = sleepers[[c for c in display_cols if c in sleepers.columns]].rename(columns={"fullName": "Player"})
+        busts_display = busts[[c for c in display_cols if c in busts.columns]].rename(columns={"fullName": "Player"})
+        count_cols_f = ["Age", "ADP", "FantasyPros Rank", "Market Rank", "Model Rank", "Fantasy Edge", "Projected HR", "Projected RBI", "Projected SB"]
+        rate_cols_f = ["Current Production Score", "Projected Production Score", "Risk / Disagreement", "Projected OPS"]
+        sleepers_display = format_display_table(clean_ui_columns(sleepers_display), count_cols=count_cols_f, rate_cols=rate_cols_f, count_decimals=1, rate_decimals=3)
+        busts_display = format_display_table(clean_ui_columns(busts_display), count_cols=count_cols_f, rate_cols=rate_cols_f, count_decimals=1, rate_decimals=3)
 
         c8, c9 = st.columns(2)
         with c8:
-            st.subheader("🔥 Sleeper Candidates")
-            render_output_table(sleeper_display, key="fantasy_sleepers", file_name="fantasy_sleepers.csv")
+            st.subheader("🔥 Market Sleepers")
+            render_output_table(sleepers_display, key="fantasy_market_sleepers", file_name="fantasy_market_sleepers.csv", style_cols=["Fantasy Edge"])
         with c9:
-            st.subheader("⚠️ Bust Risk Candidates")
-            render_output_table(bust_display, key="fantasy_busts", file_name="fantasy_busts.csv")
+            st.subheader("⚠️ Market Bust Risks")
+            render_output_table(busts_display, key="fantasy_market_busts", file_name="fantasy_market_busts.csv", style_cols=["Fantasy Edge"])
 
-        st.subheader("Fantasy Insight Summary")
+        st.subheader("Fantasy Market Insight Summary")
         st.success(
-            f"Top sleeper: {top_sleeper['fullName']} has a Sleeper Score of {fmt_rate_4(top_sleeper['Sleeper Score'])}. "
+            f"Top sleeper: {top_sleeper['fullName']} has a Fantasy Edge of {fmt_count_1(top_sleeper['Fantasy Edge'])}. "
+            f"Market Rank is {fmt_count_1(top_sleeper['Market Rank'])}, while your Model Rank is {fmt_count_1(top_sleeper['Model Rank'])}. "
             f"Projected line: {fmt_rate_3(top_sleeper['Projected OPS'])} OPS, {fmt_count_1(top_sleeper['Projected HR'])} HR, "
             f"{fmt_count_1(top_sleeper['Projected RBI'])} RBI, {fmt_count_1(top_sleeper['Projected SB'])} SB."
         )
         st.warning(
-            f"Top bust risk: {top_bust['fullName']} has a Bust Risk Score of {fmt_rate_4(top_bust['Bust Risk Score'])}. "
+            f"Top bust risk: {top_bust['fullName']} has a Fantasy Edge of {fmt_count_1(top_bust['Fantasy Edge'])}. "
+            f"Market Rank is {fmt_count_1(top_bust['Market Rank'])}, while your Model Rank is {fmt_count_1(top_bust['Model Rank'])}. "
             f"Projected line: {fmt_rate_3(top_bust['Projected OPS'])} OPS, {fmt_count_1(top_bust['Projected HR'])} HR, "
             f"{fmt_count_1(top_bust['Projected RBI'])} RBI, {fmt_count_1(top_bust['Projected SB'])} SB."
         )
