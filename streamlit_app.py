@@ -402,7 +402,6 @@ def render_output_table(df, *, key, file_name, display_rows=MAX_TABLE_DISPLAY_RO
         data=_df_to_csv_bytes(table_df),
         file_name=file_name,
         mime="text/csv",
-        key=f"download_{key}",
         width="content",
     )
 
@@ -611,6 +610,43 @@ def _axis_config_for_column(col_name, series):
     return alt.Scale(domain=domain, zero=False) if domain else alt.Scale(zero=False), alt.Axis(**axis_kwargs)
 
 
+
+
+def _full_axis_config_for_column(col_name, series):
+    """Return an Altair scale/axis pair that includes every non-null point.
+
+    Used for Full Outlier View. It avoids passing format=None to Altair, and it
+    pads the min/max slightly so outliers do not sit directly on the chart border.
+    """
+    name = str(col_name).lower().strip()
+    s = pd.to_numeric(series, errors="coerce").dropna()
+
+    if name == "year":
+        axis = alt.Axis(title=col_name, format="d")
+    else:
+        axis = alt.Axis(title=col_name)
+
+    if s.empty:
+        return alt.Scale(zero=False), axis
+
+    low = float(s.min())
+    high = float(s.max())
+
+    if not np.isfinite(low) or not np.isfinite(high):
+        return alt.Scale(zero=False), axis
+
+    if high == low:
+        pad = max(abs(high) * 0.05, 1.0)
+    else:
+        pad = (high - low) * 0.06
+
+    domain = [low - pad, high + pad]
+
+    if name == "year":
+        domain = [int(np.floor(low)), int(np.ceil(high))]
+
+    return alt.Scale(domain=domain, zero=False, nice=True), axis
+
 def _scatter_size_encoding(chart_df, size_col):
     """Scale dot size dynamically to the filtered data.
 
@@ -818,19 +854,39 @@ def render_scatterplot_section(plot_df, *, key_prefix, title="Visualize Results"
         st.info("No rows have valid values for both selected axes.")
         return
 
+    # Keep a full copy for axis domains so Full Outlier View truly includes the
+    # entire filtered result set, even if we limit plotted points for speed.
+    domain_df = chart_df.copy()
+
     if len(chart_df) > max_points:
-        chart_df = chart_df.sort_values(y_col, ascending=False).head(max_points)
-        st.caption(f"Showing {max_points:,} plotted points for speed. Narrow filters for a complete visual.")
+        if view_mode == "Full Outlier View":
+            # Preserve extreme x/y values before filling the rest with a broad sample.
+            extreme_idx = set()
+            for _col in [x_col, y_col]:
+                extreme_idx.update(chart_df.nlargest(min(25, len(chart_df)), _col).index.tolist())
+                extreme_idx.update(chart_df.nsmallest(min(25, len(chart_df)), _col).index.tolist())
+            remaining = chart_df.drop(index=list(extreme_idx), errors="ignore")
+            needed = max_points - len(extreme_idx)
+            if needed > 0 and not remaining.empty:
+                sampled = remaining.sample(n=min(needed, len(remaining)), random_state=42)
+                chart_df = pd.concat([chart_df.loc[list(extreme_idx)], sampled], axis=0)
+            else:
+                chart_df = chart_df.loc[list(extreme_idx)].head(max_points)
+            st.caption(f"Showing {len(chart_df):,} plotted points for speed, with extreme outliers preserved. Export/narrow filters for all rows.")
+        else:
+            chart_df = chart_df.sort_values(y_col, ascending=False).head(max_points)
+            st.caption(f"Showing {max_points:,} plotted points for speed. Narrow filters for a complete visual.")
 
     tooltip_cols = [c for c in ["Player", "Year", "Team", "Primary Position", "Bats", "League", x_col, y_col, "G", "Age", "Debut Age", "Final Age", "Average Age", "OPS", "HR", "SB"] if c in chart_df.columns]
     tooltip_cols = list(dict.fromkeys(tooltip_cols))
 
     if view_mode == "Full Outlier View":
-        x_scale = alt.Scale(zero=False)
-        y_scale = alt.Scale(zero=False)
-        x_axis = alt.Axis(title=x_col, format="d" if str(x_col).lower() == "year" else None)
-        y_axis = alt.Axis(title=y_col, format="d" if str(y_col).lower() == "year" else None)
+        # Full range: include every visible point/outlier on both axes.
+        # This helper avoids passing format=None into Altair, which can break the chart.
+        x_scale, x_axis = _full_axis_config_for_column(x_col, domain_df[x_col])
+        y_scale, y_axis = _full_axis_config_for_column(y_col, domain_df[y_col])
     else:
+        # Focused View: zooms to the dense middle of the data.
         x_scale, x_axis = _axis_config_for_column(x_col, chart_df[x_col])
         y_scale, y_axis = _axis_config_for_column(y_col, chart_df[y_col])
 
@@ -1598,11 +1654,10 @@ default_start_leaders = max(year_min, 2020)
 PAGE_OPTIONS = ["Historical Explorer", "Career Totals", "Leaderboards", "Comparison Tool", "Trend Value", "Valuation", "ML Predictions"]
 
 # Persist navigation and page-specific widget settings.
-# Streamlit normally deletes widget values when the widget is not rendered on the
-# current page. Re-saving existing session_state keys prevents cleanup, so filters,
-# sort choices, scatterplot axes, colors, and sizes stay when moving between pages.
-for _state_key in list(st.session_state.keys()):
-    st.session_state[_state_key] = st.session_state[_state_key]
+# IMPORTANT: Do not manually reassign widget keys in st.session_state.
+# Streamlit forbids programmatic assignment for button/download_button widgets.
+# Stable widget keys plus radio-style page navigation preserve filters and charts
+# when moving between pages during the same session.
 
 st.session_state.setdefault("active_page", "Historical Explorer")
 active_page = st.sidebar.radio("Choose Page", PAGE_OPTIONS, key="active_page")
