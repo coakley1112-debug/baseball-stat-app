@@ -1315,20 +1315,44 @@ def baseball_age_for_season(season_year, birth_year, birth_month=np.nan, birth_d
     return age
 
 def add_latest_and_projection_columns(base_df, recent_data):
+    """Add latest-season stats and simple next-season trend projections.
+
+    Safe for pages like Draft Assistant that may not already have *_trend columns.
+    Missing trend columns are treated as 0, so projection becomes latest season + 0.
+    """
     df = base_df.copy()
+
+    latest_cols = ["playerID", "R", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "BA", "OBP", "SLG", "OPS"]
+    latest_available = [c for c in latest_cols if c in recent_data.columns]
+
     latest_stats = (
         recent_data.sort_values(["playerID", "yearID"])
         .groupby("playerID")
-        .tail(1)[["playerID", "R", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "BA", "OBP", "SLG", "OPS"]]
+        .tail(1)[latest_available]
         .rename(columns={
             "R": "latest_R", "H": "latest_H", "2B": "latest_2B", "3B": "latest_3B",
             "HR": "latest_HR", "RBI": "latest_RBI", "SB": "latest_SB", "BB": "latest_BB",
             "BA": "latest_BA", "OBP": "latest_OBP", "SLG": "latest_SLG", "OPS": "latest_OPS"
         })
     )
+
     df = df.merge(latest_stats, on="playerID", how="left")
-    df["XBH_noHR_trend"] = pd.to_numeric(df["2B_trend"], errors="coerce").fillna(0) + pd.to_numeric(df["3B_trend"], errors="coerce").fillna(0)
-    df["latest_XBH_noHR"] = pd.to_numeric(df["latest_2B"], errors="coerce").fillna(0) + pd.to_numeric(df["latest_3B"], errors="coerce").fillna(0)
+
+    # If this helper is called from a page without precomputed trends, create neutral trends.
+    for stat in ["R", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "BA", "OBP", "SLG", "OPS"]:
+        trend_col = f"{stat}_trend"
+        if trend_col not in df.columns:
+            df[trend_col] = 0.0
+        df[trend_col] = pd.to_numeric(df[trend_col], errors="coerce").fillna(0)
+
+        latest_col = f"latest_{stat}"
+        if latest_col not in df.columns:
+            df[latest_col] = 0.0
+        df[latest_col] = pd.to_numeric(df[latest_col], errors="coerce").fillna(0)
+
+    df["XBH_noHR_trend"] = df["2B_trend"] + df["3B_trend"]
+    df["latest_XBH_noHR"] = df["latest_2B"] + df["latest_3B"]
+
     df["proj_R"] = df["latest_R"] + df["R_trend"]
     df["proj_H"] = df["latest_H"] + df["H_trend"]
     df["proj_XBH"] = df["latest_XBH_noHR"] + df["XBH_noHR_trend"]
