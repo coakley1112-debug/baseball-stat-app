@@ -186,6 +186,26 @@ def fmt_rate_4(x):
     if pd.isna(x): return ""
     return f"{x:.4f}"
 
+
+
+def normalize_series(series):
+    """Scale a numeric pandas Series to 0-1 safely.
+
+    Used by the fantasy and draft assistant pages so different stats
+    can be combined into one score without crashing on missing values,
+    all-equal values, or non-numeric data.
+    """
+    s = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if s.notna().sum() == 0:
+        return pd.Series(0.0, index=series.index)
+    s = s.fillna(s.median())
+    min_val = s.min()
+    max_val = s.max()
+    if pd.isna(min_val) or pd.isna(max_val) or max_val == min_val:
+        return pd.Series(0.0, index=series.index)
+    return (s - min_val) / (max_val - min_val)
+
+
 def safe_round_rate_stats(df):
     df = df.copy()
     for col in ["BA", "OBP", "SLG", "OPS", "BA_roll", "OBP_roll", "SLG_roll", "OPS_roll"]:
