@@ -347,23 +347,23 @@ def format_trend_arrow_value(x, is_rate=False):
 
 
 def format_fantasy_table(df):
-    """Fantasy page display formatting. Ranks are integers, scores/rates are clean, counting projections use 1 decimal."""
+    """Fantasy/Draft display formatting. Ranks and Fantasy Edge are integers; score/rate fields are clean."""
     df = df.copy()
-    rank_cols = ["Market Rank", "Model Rank", "Current Rank", "FantasyPros Rank", "ADP Rank", "RK", "BEST", "WORST"]
-    score_cols = ["Current Production Score", "Projected Production Score", "Sleeper Score", "Bust Risk Score"]
+    rank_cols = ["Market Rank", "Model Rank", "Current Rank", "FantasyPros Rank", "ADP Rank", "Recommendation Rank", "Draft Fit Rank", "RK", "BEST", "WORST"]
+    score_cols = [
+        "Current Production Score", "Projected Production Score", "Expected Fantasy Value",
+        "Recommendation Score", "Draft Fit Score", "Sleeper Score", "Bust Risk Score"
+    ]
     edge_cols = ["Fantasy Edge"]
     rate_cols = ["BA", "OBP", "SLG", "OPS", "Projected BA", "Projected OBP", "Projected SLG", "Projected OPS"]
     count_cols = ["R", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "Projected R", "Projected H", "Projected 2B", "Projected 3B", "Projected HR", "Projected RBI", "Projected SB", "Projected BB"]
-    one_decimal_cols = ["ADP", "Expert Std Dev", "Risk / Disagreement", "Age"]
-    for col in rank_cols:
+    one_decimal_cols = ["ADP", "Expert Std Dev", "Risk / Disagreement", "Risk Disagreement", "Age", "Availability Probability", "Position Need Bonus", "Category Need Bonus", "Risk Penalty"]
+    for col in rank_cols + edge_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").round(0).astype("Int64")
     for col in score_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").round(4)
-    for col in edge_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").round(1)
     for col in rate_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").round(4)
@@ -2507,6 +2507,13 @@ if active_page == "Fantasy Sleepers & Busts":
             "FantasyPros_2026_Hitter_MLB_ADP_Rankings.csv to the same folder/repository as streamlit_app.py."
         )
 
+    st.info(
+        "**How to read this page:** Current Production Score measures recent actual fantasy production from stats like R, HR, RBI, SB and BA/OPS. "
+        "Expected Fantasy Value estimates future value from the app's projection logic. Fantasy Edge = Market Rank − Model Rank; "
+        "positive edge means your model likes the player more than the fantasy market, while negative edge means possible bust risk. "
+        "Risk / Disagreement comes from expert ranking disagreement, so higher values mean more uncertainty."
+    )
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         fantasy_window = st.selectbox("Projection Window (Years)", [3, 4, 5], index=0, key="fantasy_market_window")
@@ -2551,6 +2558,7 @@ if active_page == "Fantasy Sleepers & Busts":
     )
     fantasy_df = fantasy_df.merge(latest_context, on="playerID", how="left")
     fantasy_df["Team"] = fantasy_df.get("primaryHistoricalTeamName", "").fillna(fantasy_df.get("primaryTeamName", ""))
+    fantasy_df["Team"] = fantasy_df["Team"].replace({"ATH": "Athletics", "OAK": "Athletics"}).fillna("Unknown")
     fantasy_df["Primary Position"] = fantasy_df.get("careerPrimaryPos", fantasy_df.get("primaryPos", "DH")).fillna(fantasy_df.get("primaryPos", "DH")).fillna("DH")
     fantasy_df["Primary Position"] = fantasy_df["Primary Position"].replace({"": "DH", "PH": "DH", "PR": "DH"}).fillna("DH")
     fantasy_df["Bats"] = fantasy_df.get("bats", "Unknown").replace({"": "Unknown"}).fillna("Unknown")
@@ -2758,8 +2766,9 @@ if active_page == "Fantasy Sleepers & Busts":
             "fullName", "Team", "Primary Position", "Age", "Market Rank", "Model Rank", "Fantasy Edge",
             "Current Production Score", "Projected Production Score", "Risk / Disagreement", "Reason"
         ]
-        sleepers_display = sleepers[[c for c in display_cols if c in sleepers.columns]].rename(columns={"fullName": "Player"})
-        busts_display = busts[[c for c in display_cols if c in busts.columns]].rename(columns={"fullName": "Player"})
+        display_rename = {"fullName": "Player", "Projected Production Score": "Expected Fantasy Value", "Risk / Disagreement": "Risk Disagreement"}
+        sleepers_display = sleepers[[c for c in display_cols if c in sleepers.columns]].rename(columns=display_rename)
+        busts_display = busts[[c for c in display_cols if c in busts.columns]].rename(columns=display_rename)
         sleepers_display = format_fantasy_table(clean_ui_columns(sleepers_display))
         busts_display = format_fantasy_table(clean_ui_columns(busts_display))
 
@@ -2773,12 +2782,12 @@ if active_page == "Fantasy Sleepers & Busts":
 
         st.subheader("Fantasy Market Insight Summary")
         st.success(
-            f"Top sleeper: {top_sleeper['fullName']} has a Fantasy Edge of {fmt_count_1(top_sleeper['Fantasy Edge'])}. "
+            f"Top sleeper: {top_sleeper['fullName']} has a Fantasy Edge of {fmt_int(top_sleeper['Fantasy Edge'])}. "
             f"Market Rank is {fmt_int(top_sleeper['Market Rank'])}, while your Model Rank is {fmt_int(top_sleeper['Model Rank'])}. "
             f"That means your model values him meaningfully higher than the draft market."
         )
         st.warning(
-            f"Top bust risk: {top_bust['fullName']} has a Fantasy Edge of {fmt_count_1(top_bust['Fantasy Edge'])}. "
+            f"Top bust risk: {top_bust['fullName']} has a Fantasy Edge of {fmt_int(top_bust['Fantasy Edge'])}. "
             f"Market Rank is {fmt_int(top_bust['Market Rank'])}, while your Model Rank is {fmt_int(top_bust['Model Rank'])}. "
             f"That means the draft market is valuing him higher than your model does."
         )
@@ -2788,6 +2797,11 @@ if active_page == "Draft Assistant Simulator":
     render_section_header(
         "🧩 Draft Assistant Simulator",
         "Use market rank, model rank, fantasy edge, roster needs, and league format to recommend the next fantasy pick."
+    )
+    st.info(
+        "**Expected Fantasy Value** estimates how valuable the player should be going forward. "
+        "**Draft Fit Score** combines expected value, Fantasy Edge, your roster needs, category needs and risk. "
+        "The page removes players you mark as already drafted; it no longer hides players just because their market rank is earlier than the current pick."
     )
 
     market_df = load_fantasypros_market_data()
@@ -2834,6 +2848,7 @@ if active_page == "Draft Assistant Simulator":
         )
         draft_df = draft_df.merge(latest_context, on="playerID", how="left")
         draft_df["Team"] = draft_df.get("primaryHistoricalTeamName", "").fillna(draft_df.get("primaryTeamName", ""))
+        draft_df["Team"] = draft_df["Team"].replace({"ATH": "Athletics", "OAK": "Athletics"}).fillna("Unknown")
         draft_df["Primary Position"] = draft_df.get("careerPrimaryPos", draft_df.get("primaryPos", "DH")).fillna(draft_df.get("primaryPos", "DH")).fillna("DH")
         draft_df["Primary Position"] = draft_df["Primary Position"].replace({"": "DH", "PH": "DH", "PR": "DH"}).fillna("DH")
         draft_df["Bats"] = draft_df.get("bats", "Unknown").replace({"": "Unknown"}).fillna("Unknown")
@@ -2859,7 +2874,7 @@ if active_page == "Draft Assistant Simulator":
         drafted_players = st.multiselect("Players Already Drafted", all_player_names, key="draft_already_drafted")
         my_roster = st.multiselect("Players On My Roster", all_player_names, key="draft_my_roster")
 
-        r1, r2, r3 = st.columns(3)
+        r1, r2 = st.columns(2)
         with r1:
             needed_positions = st.multiselect("Positions You Still Need", ["C", "1B", "2B", "3B", "SS", "OF", "DH", "P"], default=["C", "1B", "2B", "3B", "SS", "OF"], key="draft_need_positions")
         with r2:
@@ -2867,11 +2882,8 @@ if active_page == "Draft Assistant Simulator":
                 category_needs = st.multiselect("Categories to Strengthen", ["R", "HR", "RBI", "SB", "BA"], default=["HR", "RBI"], key="draft_category_needs")
             else:
                 category_needs = st.multiselect("Skill Types to Strengthen", ["Power", "Run Production", "Speed", "Walks/OPS", "Volume"], default=["Power", "Run Production"], key="draft_category_needs")
-        with r3:
-            max_market_rank = st.number_input("Only Show Players With Market Rank After Pick", min_value=0, max_value=600, value=max(0, int(current_pick) - 25), step=5, key="draft_market_rank_cut")
 
         available = draft_df[~draft_df["fullName"].isin(set(drafted_players))].copy()
-        available = available[available["Market Rank"].isna() | (available["Market Rank"] >= max_market_rank)].copy()
 
         available["Position Need Bonus"] = available["Primary Position"].apply(lambda p: 0.08 if p in needed_positions else 0.0)
         if draft_format == "5x5 Roto":
@@ -2892,19 +2904,25 @@ if active_page == "Draft Assistant Simulator":
             available["Category Need Bonus"] = cat_bonus
 
         available["Risk Penalty"] = normalize_series(pd.to_numeric(available.get("Expert Std Dev", 0), errors="coerce").fillna(0)) * 0.08
-        available["Recommendation Score"] = (
-            available["Projected Production Score"] * 0.55 +
+        available["Expected Fantasy Value"] = available["Projected Production Score"]
+        available["Availability Probability"] = 1 / (1 + np.exp(-(pd.to_numeric(available.get("Market Rank"), errors="coerce").fillna(current_pick) - float(current_pick)) / 35))
+        available["Draft Fit Score"] = (
+            available["Expected Fantasy Value"] * 0.55 +
             normalize_series(available["Fantasy Edge"].fillna(0)) * 0.25 +
             available["Position Need Bonus"] +
             available["Category Need Bonus"] -
             available["Risk Penalty"]
         )
-        available["Recommendation Rank"] = available["Recommendation Score"].rank(ascending=False, method="min")
+        available["Recommendation Score"] = available["Draft Fit Score"]
+        available["Draft Fit Rank"] = available["Draft Fit Score"].rank(ascending=False, method="min")
+        available["Recommendation Rank"] = available["Draft Fit Rank"]
 
         def make_draft_reason(r):
             pieces = []
             if pd.notna(r.get("Fantasy Edge", np.nan)) and r.get("Fantasy Edge", 0) > 0:
                 pieces.append(f"your model is {fmt_int(r['Fantasy Edge'])} ranks ahead of the market")
+            elif pd.notna(r.get("Fantasy Edge", np.nan)) and r.get("Fantasy Edge", 0) < 0:
+                pieces.append("market is higher than your model, so this is less of a value pick")
             if r.get("Primary Position") in needed_positions:
                 pieces.append(f"fills a needed {r.get('Primary Position')} slot")
             if r.get("Category Need Bonus", 0) > 0:
@@ -2912,22 +2930,98 @@ if active_page == "Draft Assistant Simulator":
             if r.get("Risk Penalty", 0) > 0.04:
                 pieces.append("has some expert-disagreement risk")
             if not pieces:
-                pieces.append("has one of the strongest projected production scores among available players")
+                pieces.append("has one of the strongest expected fantasy value scores among available players")
             return "Recommended because " + ", ".join(pieces) + "."
 
         available["Reason"] = available.apply(make_draft_reason, axis=1)
-        recs = available.sort_values("Recommendation Score", ascending=False).head(draft_top_n).copy()
-        rec_cols = ["fullName", "Team", "Primary Position", "Age", "Market Rank", "Model Rank", "Fantasy Edge", "Projected Production Score", "Recommendation Score", "Reason"]
+
+        # Team Category Strength Analyzer / Roster Construction Heatmap
+        st.subheader("Roster Construction Heatmap")
+        roster_df = draft_df[draft_df["fullName"].isin(set(my_roster))].copy()
+        if roster_df.empty:
+            st.info("Add players to 'Players On My Roster' to see your team category strengths and weaknesses.")
+        else:
+            if draft_format == "5x5 Roto":
+                cat_defs = {"R": "proj_R", "HR": "proj_HR", "RBI": "proj_RBI", "SB": "proj_SB", "BA": "proj_BA"}
+            else:
+                cat_defs = {"Power": "proj_HR", "Run Production": "proj_RBI", "Speed": "proj_SB", "Walks/OPS": "proj_OPS", "Volume": "AB"}
+            heat_rows = []
+            for label, col in cat_defs.items():
+                roster_val = pd.to_numeric(roster_df.get(col, 0), errors="coerce").sum() if col != "proj_BA" else pd.to_numeric(roster_df.get(col, np.nan), errors="coerce").mean()
+                pool_avg = pd.to_numeric(draft_df.get(col, 0), errors="coerce").mean()
+                pool_std = pd.to_numeric(draft_df.get(col, 0), errors="coerce").std()
+                z = 0 if pd.isna(pool_std) or pool_std == 0 else (roster_val / max(len(roster_df), 1) - pool_avg) / pool_std
+                if z >= 0.75:
+                    strength = "Strong"
+                elif z <= -0.75:
+                    strength = "Weak"
+                else:
+                    strength = "Average"
+                heat_rows.append({"Category": label, "Team Strength": strength, "Strength Score": z})
+            heat_df = pd.DataFrame(heat_rows)
+            def roster_heat_style(val):
+                try:
+                    v = float(val)
+                    if v >= 0.75:
+                        return "background-color:#006400; color:white; font-weight:bold;"
+                    if v > 0:
+                        return "background-color:#c6efce; color:#006100;"
+                    if v <= -0.75:
+                        return "background-color:#8b0000; color:white; font-weight:bold;"
+                    if v < 0:
+                        return "background-color:#ffc7ce; color:#9c0006;"
+                except Exception:
+                    return ""
+                return ""
+            st.dataframe(
+                heat_df.style.map(roster_heat_style, subset=["Strength Score"]).format({"Strength Score": "{:.2f}"}),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        recs = available.sort_values("Draft Fit Score", ascending=False).head(draft_top_n).copy()
+        best_value = available.sort_values("Expected Fantasy Value", ascending=False).head(1).copy()
+        best_fit = available.sort_values("Draft Fit Score", ascending=False).head(1).copy()
+
+        st.subheader("Best Pick vs Best Value")
+        bv1, bv2 = st.columns(2)
+        with bv1:
+            if not best_fit.empty:
+                bf = best_fit.iloc[0]
+                st.success(f"Best Team Fit: {bf['fullName']} — Draft Fit Score {fmt_rate_4(bf.get('Draft Fit Score'))}. {bf['Reason']}")
+        with bv2:
+            if not best_value.empty:
+                bv = best_value.iloc[0]
+                st.info(f"Best Raw Value: {bv['fullName']} — Expected Fantasy Value {fmt_rate_4(bv.get('Expected Fantasy Value'))}. This is the strongest available player by projected value before roster-fit bonuses.")
+
+        rec_cols = ["fullName", "Team", "Primary Position", "Age", "Market Rank", "Model Rank", "Fantasy Edge", "Current Production Score", "Expected Fantasy Value", "Draft Fit Score", "Reason"]
         recs_display = recs[[c for c in rec_cols if c in recs.columns]].rename(columns={"fullName": "Player"})
         recs_display = format_fantasy_table(clean_ui_columns(recs_display))
         st.subheader("Recommended Picks")
         render_output_table(recs_display, key="draft_assistant_recommendations", file_name="draft_assistant_recommendations.csv", style_cols=["Fantasy Edge"])
 
+        st.subheader("Dynamic Draft Board")
+        board_cols = ["fullName", "Team", "Primary Position", "Market Rank", "Model Rank", "Fantasy Edge", "Expected Fantasy Value", "Draft Fit Score"]
+        drafted_board = draft_df[draft_df["fullName"].isin(set(drafted_players))].copy()
+        available_board = available.sort_values("Market Rank", na_position="last").head(25).copy()
+        bcol1, bcol2 = st.columns(2)
+        with bcol1:
+            st.caption("Drafted / Removed Players")
+            if drafted_board.empty:
+                st.write("No drafted players selected yet.")
+            else:
+                drafted_display = drafted_board[[c for c in board_cols if c in drafted_board.columns]].rename(columns={"fullName": "Player"})
+                render_output_table(format_fantasy_table(clean_ui_columns(drafted_display)), key="draft_board_drafted", file_name="drafted_players.csv")
+        with bcol2:
+            st.caption("Top Available by Market Rank")
+            available_display = available_board[[c for c in board_cols if c in available_board.columns]].rename(columns={"fullName": "Player"})
+            render_output_table(format_fantasy_table(clean_ui_columns(available_display)), key="draft_board_available", file_name="available_players.csv", style_cols=["Fantasy Edge"])
+
         if not recs.empty:
             best = recs.iloc[0]
             st.success(
                 f"Best pick available: {best['fullName']}. Market Rank {fmt_int(best.get('Market Rank'))}, "
-                f"Model Rank {fmt_int(best.get('Model Rank'))}, Fantasy Edge {fmt_count_1(best.get('Fantasy Edge'))}. "
+                f"Model Rank {fmt_int(best.get('Model Rank'))}, Fantasy Edge {fmt_int(best.get('Fantasy Edge'))}. "
                 f"{best['Reason']}"
             )
 
