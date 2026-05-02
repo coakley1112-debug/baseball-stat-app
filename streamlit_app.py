@@ -828,31 +828,65 @@ def _scatter_color_encoding(chart_df, color_col):
             legend=alt.Legend(title=color_col)
         )
 
-    if color_col == "Team" and "League" in chart_df.columns:
-        chart_df["League"] = (
-            chart_df["League"]
-            .replace({"AL": "American League", "NL": "National League", "Unknown League": "Unknown", "": "Unknown", None: "Unknown"})
-            .fillna("Unknown")
-        )
-        teams = [t for t in sorted(chart_df["Team"].dropna().astype(str).unique()) if t]
-        al_palette = ["#08306b", "#08519c", "#2171b5", "#4292c6", "#6baed6", "#3182bd", "#084594", "#0868ac"]
-        nl_palette = ["#fee0d2", "#fcbba1", "#fc9272", "#fb6a4a", "#ef3b2c", "#fcae91", "#fdd0a2", "#e34a33"]
-        other_palette = ["#bdbdbd", "#ffffff"]
-        domain, colors = [], []
-        for i, team in enumerate(teams):
-            league_vals = chart_df.loc[chart_df["Team"].astype(str) == team, "League"].astype(str)
-            league = league_vals.mode().iloc[0] if not league_vals.mode().empty else "Unknown"
-            domain.append(team)
-            if league == "American League":
-                colors.append(al_palette[i % len(al_palette)])
-            elif league == "National League":
-                colors.append(nl_palette[i % len(nl_palette)])
-            else:
-                colors.append(other_palette[i % len(other_palette)])
+    if color_col == "Team":
+        # Team scatter colors: approximate MLB primary colors.
+        # AL teams use darker shades; NL teams use lighter shades.
+        TEAM_SCATTER_COLORS = {
+            # American League — darker
+            "Baltimore Orioles": "#df4601",
+            "Boston Red Sox": "#8b1e2d",
+            "New York Yankees": "#0c2340",
+            "Tampa Bay Rays": "#092c5c",
+            "Toronto Blue Jays": "#134a8e",
+            "Chicago White Sox": "#000000",
+            "Cleveland Guardians": "#8b0000",
+            "Cleveland Indians": "#8b0000",
+            "Detroit Tigers": "#0c2340",
+            "Kansas City Royals": "#004687",
+            "Minnesota Twins": "#002b5c",
+            "Houston Astros": "#002d62",
+            "Los Angeles Angels": "#8b0000",
+            "Athletics": "#003831",
+            "Oakland Athletics": "#003831",
+            "Philadelphia Athletics": "#003831",
+            "Kansas City Athletics": "#003831",
+            "Seattle Mariners": "#005c5c",
+            "Texas Rangers": "#003278",
+
+            # National League — lighter
+            "Arizona Diamondbacks": "#c86b75",
+            "Atlanta Braves": "#ce6b75",
+            "Chicago Cubs": "#6baed6",
+            "Cincinnati Reds": "#fb6a4a",
+            "Colorado Rockies": "#b39ddb",
+            "Los Angeles Dodgers": "#6baed6",
+            "Brooklyn Dodgers": "#6baed6",
+            "Miami Marlins": "#66c2a5",
+            "Florida Marlins": "#66c2a5",
+            "Milwaukee Brewers": "#f2c94c",
+            "Seattle Pilots": "#f2c94c",
+            "New York Mets": "#74a9cf",
+            "Philadelphia Phillies": "#fb6a4a",
+            "Pittsburgh Pirates": "#f2c94c",
+            "San Diego Padres": "#c2a477",
+            "San Francisco Giants": "#fdae6b",
+            "New York Giants": "#fdae6b",
+            "St. Louis Cardinals": "#fb6a4a",
+            "Washington Nationals": "#fb6a4a",
+            "Montreal Expos": "#fb6a4a",
+            "Milwaukee Braves": "#ce6b75",
+            "Boston Braves": "#ce6b75",
+            "Unknown": "#bdbdbd",
+            "": "#bdbdbd",
+        }
+
+        chart_df[color_col] = chart_df[color_col].replace({"": "Unknown", None: "Unknown"}).fillna("Unknown")
+        teams = [t for t in sorted(chart_df[color_col].dropna().astype(str).unique()) if t]
+        colors = [TEAM_SCATTER_COLORS.get(t, "#bdbdbd") for t in teams]
         return alt.Color(
             f"{color_col}:N",
             title=color_col,
-            scale=alt.Scale(domain=domain, range=colors),
+            scale=alt.Scale(domain=teams, range=colors),
             legend=alt.Legend(title=color_col)
         )
 
@@ -979,7 +1013,17 @@ def render_scatterplot_section(plot_df, *, key_prefix, title="Visualize Results"
             chart_df = chart_df.sort_values(y_col, ascending=False).head(max_points)
             st.caption(f"Showing {max_points:,} plotted points for speed. Narrow filters for a complete visual.")
 
-    tooltip_cols = [c for c in ["Player", "Year", "Team", "Primary Position", "Bats", "League", x_col, y_col, "G", "Age", "Debut Age", "Final Age", "Average Age", "OPS", "HR", "SB"] if c in chart_df.columns]
+    if key_prefix == "career":
+        tooltip_order = [
+            "Player", "Debut Age", "Final Age", "Team", "Primary Position", "Bats", "League",
+            "HR", "OPS", "G", "SB", x_col, y_col
+        ]
+    else:
+        tooltip_order = [
+            "Player", "Year", "Team", "Age", "Primary Position", "Bats", "League",
+            "HR", "OPS", "G", "SB", "BB", x_col, y_col
+        ]
+    tooltip_cols = [c for c in tooltip_order if c in chart_df.columns]
     tooltip_cols = list(dict.fromkeys(tooltip_cols))
 
     if view_mode == "Full Outlier View":
@@ -1912,7 +1956,7 @@ year_max = int(max(all_years))
 default_start_hist = max(year_min, 2010)
 default_start_leaders = max(year_min, 2020)
 
-PAGE_OPTIONS = ["Historical Explorer", "Career Totals", "Leaderboards", "Comparison Tool", "Trend Value", "Fantasy Sleepers & Busts", "Valuation", "ML Predictions"]
+PAGE_OPTIONS = ["Historical Explorer", "Career Totals", "Leaderboards", "Comparison Tool", "Trend Value", "Fantasy Sleepers & Busts", "Draft Assistant Simulator", "Valuation", "ML Predictions"]
 
 # Persist navigation and page-specific widget settings.
 # IMPORTANT: Do not manually reassign widget keys in st.session_state.
@@ -2565,7 +2609,7 @@ if active_page == "Fantasy Sleepers & Busts":
         m4.metric("Avg Fantasy Edge", fmt_count_1(fantasy_df["Fantasy Edge"].mean()))
 
         st.subheader("Fantasy Edge Map: Market Rank vs Model Rank")
-        st.caption("Below the diagonal = your model ranks the player better than the market, which points to sleeper value. Above the diagonal = possible bust risk.")
+        st.caption("Above the diagonal = sleeper value: your model rank is better/lower than the market rank. Below the diagonal = possible bust risk: the market ranks the player better than your model.")
 
         fantasy_plot_cols = [
             "fullName", "Player", "Team", "Primary Position", "Bats", "League", "Age",
@@ -2603,6 +2647,13 @@ if active_page == "Fantasy Sleepers & Busts":
             index=0,
             key="fantasy_market_scatter_size"
         )
+        fantasy_view_mode = st.radio(
+            "Scatterplot View",
+            ["Focused View", "Full Outlier View"],
+            horizontal=True,
+            key="fantasy_edge_scatter_view_mode",
+            help="Focused View keeps the main cluster readable. Full Outlier View expands the axes to include every player/outlier."
+        )
 
         required_plot_cols = ["Market Rank", "Model Rank"]
         missing_plot_cols = [col for col in required_plot_cols if col not in fantasy_plot_df.columns]
@@ -2616,10 +2667,24 @@ if active_page == "Fantasy Sleepers & Busts":
                 base = alt.Chart(chart_source).mark_circle(
                     opacity=0.74, stroke="#333333", strokeWidth=0.45
                 )
-                tooltip_cols = [c for c in ["Player", "Team", "Primary Position", "Bats", "League", "Age", "Market Rank", "Model Rank", "Fantasy Edge", "ADP", "FantasyPros Rank", "Expert Std Dev", "Projected OPS", "Projected HR", "Projected RBI", "Projected SB"] if c in chart_source.columns]
+                tooltip_cols = [c for c in [
+                    "Player", "Age", "Team", "Primary Position", "Bats",
+                    "Market Rank", "Model Rank", "Fantasy Edge",
+                    "Current Production Score", "Projected Production Score"
+                ] if c in chart_source.columns]
+
+                if fantasy_view_mode == "Full Outlier View":
+                    x_scale = alt.Scale(zero=False, reverse=True)
+                    y_scale = alt.Scale(zero=False, reverse=True)
+                else:
+                    x_domain = _smart_axis_domain(chart_source["Market Rank"])
+                    y_domain = _smart_axis_domain(chart_source["Model Rank"])
+                    x_scale = alt.Scale(domain=x_domain, zero=False, reverse=True) if x_domain else alt.Scale(zero=False, reverse=True)
+                    y_scale = alt.Scale(domain=y_domain, zero=False, reverse=True) if y_domain else alt.Scale(zero=False, reverse=True)
+
                 enc = {
-                    "x": alt.X("Market Rank:Q", title="Market Rank / ADP Rank", scale=alt.Scale(zero=False, reverse=True)),
-                    "y": alt.Y("Model Rank:Q", title="Your Model Rank", scale=alt.Scale(zero=False, reverse=True)),
+                    "x": alt.X("Market Rank:Q", title="Market Rank", scale=x_scale),
+                    "y": alt.Y("Model Rank:Q", title="Your Model Rank", scale=y_scale),
                     "tooltip": tooltip_cols
                 }
                 color_encoding = _scatter_color_encoding(chart_source, fantasy_color_col)
@@ -2643,8 +2708,8 @@ if active_page == "Fantasy Sleepers & Busts":
         busts["Reason"] = busts.apply(lambda r: make_fantasy_market_reason(r, "bust"), axis=1)
 
         display_cols = [
-            "fullName", "Team", "Primary Position", "Age", "ADP", "FantasyPros Rank", "Market Rank", "Model Rank", "Fantasy Edge",
-            "Current Production Score", "Projected Production Score", "Risk / Disagreement", "Projected OPS", "Projected HR", "Projected RBI", "Projected SB", "Reason"
+            "fullName", "Team", "Primary Position", "Age", "Market Rank", "Model Rank", "Fantasy Edge",
+            "Current Production Score", "Projected Production Score", "Risk / Disagreement", "Reason"
         ]
         sleepers_display = sleepers[[c for c in display_cols if c in sleepers.columns]].rename(columns={"fullName": "Player"})
         busts_display = busts[[c for c in display_cols if c in busts.columns]].rename(columns={"fullName": "Player"})
@@ -2663,15 +2728,161 @@ if active_page == "Fantasy Sleepers & Busts":
         st.success(
             f"Top sleeper: {top_sleeper['fullName']} has a Fantasy Edge of {fmt_count_1(top_sleeper['Fantasy Edge'])}. "
             f"Market Rank is {fmt_int(top_sleeper['Market Rank'])}, while your Model Rank is {fmt_int(top_sleeper['Model Rank'])}. "
-            f"Projected line: {fmt_rate_4(top_sleeper['Projected OPS'])} OPS, {fmt_count_1(top_sleeper['Projected HR'])} HR, "
-            f"{fmt_count_1(top_sleeper['Projected RBI'])} RBI, {fmt_count_1(top_sleeper['Projected SB'])} SB."
+            f"That means your model values him meaningfully higher than the draft market."
         )
         st.warning(
             f"Top bust risk: {top_bust['fullName']} has a Fantasy Edge of {fmt_count_1(top_bust['Fantasy Edge'])}. "
             f"Market Rank is {fmt_int(top_bust['Market Rank'])}, while your Model Rank is {fmt_int(top_bust['Model Rank'])}. "
-            f"Projected line: {fmt_rate_4(top_bust['Projected OPS'])} OPS, {fmt_count_1(top_bust['Projected HR'])} HR, "
-            f"{fmt_count_1(top_bust['Projected RBI'])} RBI, {fmt_count_1(top_bust['Projected SB'])} SB."
+            f"That means the draft market is valuing him higher than your model does."
         )
+
+
+if active_page == "Draft Assistant Simulator":
+    render_section_header(
+        "🧩 Draft Assistant Simulator",
+        "Use market rank, model rank, fantasy edge, roster needs, and league format to recommend the next fantasy pick."
+    )
+
+    market_df = load_fantasypros_market_data()
+    if market_df.empty:
+        st.warning(
+            "FantasyPros files were not found. Upload FantasyPros_2026_Draft_H_Rankings.csv and "
+            "FantasyPros_2026_Hitter_MLB_ADP_Rankings.csv to the same folder/repository as streamlit_app.py."
+        )
+    else:
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            draft_window = st.selectbox("Projection Window", [3, 4, 5], index=0, key="draft_window")
+        with d2:
+            draft_format = st.selectbox("League Format", ["5x5 Roto", "Points League"], index=0, key="draft_format")
+        with d3:
+            current_pick = st.number_input("Current Pick Number", min_value=1, max_value=500, value=100, step=1, key="draft_pick_number")
+        with d4:
+            draft_top_n = st.slider("Recommendations to Show", 5, 30, 10, key="draft_top_n")
+
+        max_year_draft = int(yearly_df["yearID"].max())
+        draft_years = list(range(max_year_draft - draft_window + 1, max_year_draft + 1))
+        recent_draft = yearly_df[yearly_df["yearID"].isin(draft_years)].copy().sort_values(["playerID", "yearID"])
+
+        agg_draft = recent_draft.groupby(["playerID", "fullName", "bats"], as_index=False)[
+            ["G", "R", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "BB", "HBP", "SF"]
+        ].sum()
+        agg_draft = add_rate_stats(agg_draft)
+        agg_draft = agg_draft[(agg_draft["G"] >= 30) & (agg_draft["AB"] >= 75)].copy()
+
+        draft_trends = recent_draft.groupby("playerID").apply(lambda g: pd.Series({
+            "R_trend": compute_trend_slope(g, "R"), "HR_trend": compute_trend_slope(g, "HR"),
+            "RBI_trend": compute_trend_slope(g, "RBI"), "SB_trend": compute_trend_slope(g, "SB"),
+            "BA_trend": compute_trend_slope(g, "BA"), "OPS_trend": compute_trend_slope(g, "OPS"),
+            "BB_trend": compute_trend_slope(g, "BB")
+        })).reset_index()
+        draft_df = agg_draft.merge(draft_trends, on="playerID", how="left")
+        draft_df = add_latest_and_projection_columns(draft_df, recent_draft)
+
+        latest_cols = ["playerID", "primaryHistoricalTeamName", "primaryTeamName", "primaryLeague", "careerPrimaryPos", "primaryPos", "yearID", "birthYear", "birthMonth", "birthDay"]
+        latest_context = recent_draft.sort_values(["playerID", "yearID"]).groupby("playerID").tail(1)[[c for c in latest_cols if c in recent_draft.columns]].copy()
+        latest_context["Age"] = latest_context.apply(
+            lambda r: baseball_age_for_season(r.get("yearID"), r.get("birthYear"), r.get("birthMonth", np.nan), r.get("birthDay", np.nan)),
+            axis=1
+        )
+        draft_df = draft_df.merge(latest_context, on="playerID", how="left")
+        draft_df["Team"] = draft_df.get("primaryHistoricalTeamName", "").fillna(draft_df.get("primaryTeamName", ""))
+        draft_df["Primary Position"] = draft_df.get("careerPrimaryPos", draft_df.get("primaryPos", "DH")).fillna(draft_df.get("primaryPos", "DH")).fillna("DH")
+        draft_df["Primary Position"] = draft_df["Primary Position"].replace({"": "DH", "PH": "DH", "PR": "DH"}).fillna("DH")
+        draft_df["Bats"] = draft_df.get("bats", "Unknown").replace({"": "Unknown"}).fillna("Unknown")
+        draft_df["League"] = draft_df.get("primaryLeague", "Unknown").replace({"AL": "American League", "NL": "National League", "": "Unknown"}).fillna("Unknown")
+        draft_df["Player Key"] = draft_df["fullName"].apply(normalize_player_name)
+
+        market_cols = [c for c in ["Player Key", "ADP", "ADP Rank", "FantasyPros Rank", "Expert Avg Rank", "Expert Std Dev", "Market Rank"] if c in market_df.columns]
+        draft_df = draft_df.merge(market_df[market_cols], on="Player Key", how="left")
+        draft_df["Market Rank"] = pd.to_numeric(draft_df.get("Market Rank"), errors="coerce")
+
+        if draft_format == "5x5 Roto":
+            draft_df["Current Production Score"] = normalize_series(draft_df["R"]) * 0.20 + normalize_series(draft_df["HR"]) * 0.20 + normalize_series(draft_df["RBI"]) * 0.20 + normalize_series(draft_df["SB"]) * 0.20 + normalize_series(draft_df["BA"]) * 0.20
+            draft_df["Projected Production Score"] = normalize_series(draft_df["proj_R"]) * 0.20 + normalize_series(draft_df["proj_HR"]) * 0.20 + normalize_series(draft_df["proj_RBI"]) * 0.20 + normalize_series(draft_df["proj_SB"]) * 0.20 + normalize_series(draft_df["proj_BA"]) * 0.20
+        else:
+            draft_df["Current Production Score"] = normalize_series(draft_df["HR"] * 4 + draft_df["RBI"] + draft_df["R"] + draft_df["SB"] * 2 + draft_df["BB"] + draft_df["OPS"] * 20)
+            draft_df["Projected Production Score"] = normalize_series(draft_df["proj_HR"] * 4 + draft_df["proj_RBI"] + draft_df["proj_R"] + draft_df["proj_SB"] * 2 + draft_df["proj_BB"] + draft_df["proj_OPS"] * 20)
+
+        draft_df["Model Rank"] = draft_df["Projected Production Score"].rank(ascending=False, method="min")
+        draft_df["Fantasy Edge"] = draft_df["Market Rank"] - draft_df["Model Rank"]
+
+        st.subheader("Roster / Draft Controls")
+        all_player_names = sorted(draft_df["fullName"].dropna().unique())
+        drafted_players = st.multiselect("Players Already Drafted", all_player_names, key="draft_already_drafted")
+        my_roster = st.multiselect("Players On My Roster", all_player_names, key="draft_my_roster")
+
+        r1, r2, r3 = st.columns(3)
+        with r1:
+            needed_positions = st.multiselect("Positions You Still Need", ["C", "1B", "2B", "3B", "SS", "OF", "DH", "P"], default=["C", "1B", "2B", "3B", "SS", "OF"], key="draft_need_positions")
+        with r2:
+            if draft_format == "5x5 Roto":
+                category_needs = st.multiselect("Categories to Strengthen", ["R", "HR", "RBI", "SB", "BA"], default=["HR", "RBI"], key="draft_category_needs")
+            else:
+                category_needs = st.multiselect("Skill Types to Strengthen", ["Power", "Run Production", "Speed", "Walks/OPS", "Volume"], default=["Power", "Run Production"], key="draft_category_needs")
+        with r3:
+            max_market_rank = st.number_input("Only Show Players With Market Rank After Pick", min_value=0, max_value=600, value=max(0, int(current_pick) - 25), step=5, key="draft_market_rank_cut")
+
+        available = draft_df[~draft_df["fullName"].isin(set(drafted_players))].copy()
+        available = available[available["Market Rank"].isna() | (available["Market Rank"] >= max_market_rank)].copy()
+
+        available["Position Need Bonus"] = available["Primary Position"].apply(lambda p: 0.08 if p in needed_positions else 0.0)
+        if draft_format == "5x5 Roto":
+            cat_bonus = pd.Series(0.0, index=available.index)
+            if "R" in category_needs: cat_bonus += normalize_series(available["proj_R"]) * 0.05
+            if "HR" in category_needs: cat_bonus += normalize_series(available["proj_HR"]) * 0.06
+            if "RBI" in category_needs: cat_bonus += normalize_series(available["proj_RBI"]) * 0.06
+            if "SB" in category_needs: cat_bonus += normalize_series(available["proj_SB"]) * 0.07
+            if "BA" in category_needs: cat_bonus += normalize_series(available["proj_BA"]) * 0.05
+            available["Category Need Bonus"] = cat_bonus
+        else:
+            cat_bonus = pd.Series(0.0, index=available.index)
+            if "Power" in category_needs: cat_bonus += normalize_series(available["proj_HR"]) * 0.07
+            if "Run Production" in category_needs: cat_bonus += normalize_series(available["proj_RBI"] + available["proj_R"]) * 0.06
+            if "Speed" in category_needs: cat_bonus += normalize_series(available["proj_SB"]) * 0.05
+            if "Walks/OPS" in category_needs: cat_bonus += normalize_series(available["proj_BB"] + available["proj_OPS"] * 50) * 0.05
+            if "Volume" in category_needs: cat_bonus += normalize_series(available["AB"]) * 0.04
+            available["Category Need Bonus"] = cat_bonus
+
+        available["Risk Penalty"] = normalize_series(pd.to_numeric(available.get("Expert Std Dev", 0), errors="coerce").fillna(0)) * 0.08
+        available["Recommendation Score"] = (
+            available["Projected Production Score"] * 0.55 +
+            normalize_series(available["Fantasy Edge"].fillna(0)) * 0.25 +
+            available["Position Need Bonus"] +
+            available["Category Need Bonus"] -
+            available["Risk Penalty"]
+        )
+        available["Recommendation Rank"] = available["Recommendation Score"].rank(ascending=False, method="min")
+
+        def make_draft_reason(r):
+            pieces = []
+            if pd.notna(r.get("Fantasy Edge", np.nan)) and r.get("Fantasy Edge", 0) > 0:
+                pieces.append(f"your model is {fmt_int(r['Fantasy Edge'])} ranks ahead of the market")
+            if r.get("Primary Position") in needed_positions:
+                pieces.append(f"fills a needed {r.get('Primary Position')} slot")
+            if r.get("Category Need Bonus", 0) > 0:
+                pieces.append("helps your selected category needs")
+            if r.get("Risk Penalty", 0) > 0.04:
+                pieces.append("has some expert-disagreement risk")
+            if not pieces:
+                pieces.append("has one of the strongest projected production scores among available players")
+            return "Recommended because " + ", ".join(pieces) + "."
+
+        available["Reason"] = available.apply(make_draft_reason, axis=1)
+        recs = available.sort_values("Recommendation Score", ascending=False).head(draft_top_n).copy()
+        rec_cols = ["fullName", "Team", "Primary Position", "Age", "Market Rank", "Model Rank", "Fantasy Edge", "Projected Production Score", "Recommendation Score", "Reason"]
+        recs_display = recs[[c for c in rec_cols if c in recs.columns]].rename(columns={"fullName": "Player"})
+        recs_display = format_fantasy_table(clean_ui_columns(recs_display))
+        st.subheader("Recommended Picks")
+        render_output_table(recs_display, key="draft_assistant_recommendations", file_name="draft_assistant_recommendations.csv", style_cols=["Fantasy Edge"])
+
+        if not recs.empty:
+            best = recs.iloc[0]
+            st.success(
+                f"Best pick available: {best['fullName']}. Market Rank {fmt_int(best.get('Market Rank'))}, "
+                f"Model Rank {fmt_int(best.get('Model Rank'))}, Fantasy Edge {fmt_count_1(best.get('Fantasy Edge'))}. "
+                f"{best['Reason']}"
+            )
 
 if active_page == "Valuation":
     render_section_header("💰 Valuation", "Blend recent production and trend momentum into a valuation score.")
