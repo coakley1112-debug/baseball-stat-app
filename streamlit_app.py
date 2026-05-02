@@ -1153,6 +1153,9 @@ def normalize_player_name_for_merge(name):
     return text
 
 
+# Backward-compatible alias used by Draft Assistant code
+normalize_player_name = normalize_player_name_for_merge
+
 def read_optional_csv(filename):
     """Read an optional CSV from the same app folder. Return empty df if missing."""
     path = BASE_DIR / filename
@@ -2815,7 +2818,7 @@ if active_page == "Draft Assistant Simulator":
         draft_df["Primary Position"] = draft_df["Primary Position"].replace({"": "DH", "PH": "DH", "PR": "DH"}).fillna("DH")
         draft_df["Bats"] = draft_df.get("bats", "Unknown").replace({"": "Unknown"}).fillna("Unknown")
         draft_df["League"] = draft_df.get("primaryLeague", "Unknown").replace({"AL": "American League", "NL": "National League", "": "Unknown"}).fillna("Unknown")
-        draft_df["Player Key"] = draft_df["fullName"].apply(normalize_player_name)
+        draft_df["Player Key"] = draft_df["fullName"].apply(normalize_player_name_for_merge)
 
         market_cols = [c for c in ["Player Key", "ADP", "ADP Rank", "FantasyPros Rank", "Expert Avg Rank", "Expert Std Dev", "Market Rank"] if c in market_df.columns]
         draft_df = draft_df.merge(market_df[market_cols], on="Player Key", how="left")
